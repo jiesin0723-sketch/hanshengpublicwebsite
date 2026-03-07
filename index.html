@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>汉盛律师 - 智能法律助手</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/vanta@latest/dist/vanta.waves.min.js"></script>
+    
+    <style>
+        /* --- 全局暗黑科幻风格 --- */
+        :root {
+            --primary-red: #8b181b; 
+            --glass-bg: rgba(5, 8, 15, 0.4); 
+            --glass-border: rgba(255, 255, 255, 0.05); 
+            --text-white: #ffffff;
+            --text-cyan: #8ce8ff; 
+            --text-light: #8b949e;
+            --hover-bg: rgba(255, 255, 255, 0.05);
+        }
+
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text-white);
+            background-color: #000000; 
+            overflow: hidden;
+        }
+
+        /* --- 动态 3D 波浪背景容器 --- */
+        #vanta-bg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 0;
+        }
+
+        /* --- 主体布局 --- */
+        .app-container {
+            position: relative;
+            z-index: 10;
+            display: flex;
+            width: 100%;
+            height: 100%;
+            background: transparent; 
+        }
+
+        /* --- 左侧菜单栏 --- */
+        aside {
+            width: 280px;
+            background: linear-gradient(180deg, rgba(10,12,20,0.8) 0%, rgba(5,6,10,0.6) 100%);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-right: 1px solid var(--glass-border);
+            display: flex;
+            flex-direction: column;
+            padding: 24px 20px;
+            flex-shrink: 0;
+        }
+
+        .new-chat-btn {
+            background-color: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 14px 16px;
+            border-radius: 12px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 400;
+            color: var(--text-white);
+            transition: all 0.3s ease;
+            margin-bottom: 35px;
+            font-size: 14px;
+            letter-spacing: 1px;
+        }
+
+        .new-chat-btn:hover {
+            background-color: rgba(140, 232, 255, 0.1);
+            border-color: rgba(140, 232, 255, 0.3);
+            box-shadow: 0 0 15px rgba(140, 232, 255, 0.2);
+            color: var(--text-cyan);
+        }
+
+        .history-title { font-size: 12px; color: var(--text-light); margin-bottom: 16px; padding-left: 8px; letter-spacing: 1px; }
+        .history-list { list-style: none; padding: 0; margin: 0; overflow-y: auto; flex: 1; }
+        .history-item { padding: 12px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; color: rgba(255, 255, 255, 0.6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: all 0.2s; margin-bottom: 4px; }
+        .history-item:hover { background-color: var(--hover-bg); color: var(--text-white); }
+        .history-item.active { background-color: rgba(140, 232, 255, 0.14); color: var(--text-cyan); border: 1px solid rgba(140, 232, 255, 0.28); }
+        .history-empty { padding: 12px 16px; font-size: 13px; color: rgba(255,255,255,0.35); }
+
+        /* --- 右侧主内容区 --- */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        header {
+            padding: 24px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        /* --- 优化 1 & 2: Logo 完美融合并放大 --- */
+        .logo-container {
+            display: flex;
+            align-items: center;
+            background: transparent; /* 去除白底 */
+        }
+
+        header img {
+            height: 55px; /* 放大更醒目 */
+            object-fit: contain;
+            /* 滤镜魔法：颜色反转、提亮，并滤除黑色背景，使其变为全息发光体 */
+            filter: invert(1) brightness(1.8) contrast(1.2);
+            mix-blend-mode: screen;
+            opacity: 0.9;
+            transition: all 0.3s ease;
+        }
+        
+        header img:hover {
+            opacity: 1;
+            filter: invert(1) brightness(2.2) contrast(1.2);
+        }
+
+        /* --- 右上角功能区 (头像与设置) --- */
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .settings-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: var(--text-white);
+            border-radius: 50%;
+            width: 42px;
+            height: 42px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }
+
+        .settings-btn:hover {
+            background: rgba(255, 255, 255, 0.15);
+            box-shadow: 0 0 15px rgba(255,255,255,0.2);
+            transform: rotate(45deg);
+        }
+
+        .user-avatar {
+            width: 42px;
+            height: 42px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary-red), #e63946);
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 0 15px rgba(139, 24, 27, 0.4);
+            text-transform: uppercase;
+        }
+
+        main { flex: 1; display: flex; justify-content: center; overflow-y: auto; padding: 20px; scroll-behavior: smooth; position: relative; }
+
+        /* --- 首页欢迎语 --- */
+        .welcome-screen { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100%; position: absolute; width: 100%; top: -5%; left: 0; pointer-events: none; transition: opacity 0.5s ease; }
+        .stellar-greeting { font-size: 52px; font-weight: 200; letter-spacing: 8px; color: #ffffff; text-shadow: 0 0 30px rgba(140, 232, 255, 0.6), 0 0 60px rgba(140, 232, 255, 0.3); text-align: center; margin-bottom: 16px; }
+        .stellar-subtext { font-size: 16px; font-weight: 300; letter-spacing: 2px; color: rgba(255, 255, 255, 0.5); mask-image: linear-gradient(to bottom, white 50%, rgba(255,255,255,0.1) 100%); -webkit-mask-image: linear-gradient(to bottom, white 50%, rgba(255,255,255,0.1) 100%); }
+
+        /* --- 聊天区域与输入框 --- */
+        .chat-container { width: 100%; max-width: 800px; display: flex; flex-direction: column; gap: 30px; padding-bottom: 20px; z-index: 5; }
+        .message { display: flex; flex-direction: column; max-width: 85%; line-height: 1.6; font-size: 15px; }
+        .message.user { align-self: flex-end; background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); padding: 16px 24px; border-radius: 20px 20px 4px 20px; border: 1px solid rgba(255, 255, 255, 0.1); }
+        .message.ai { align-self: flex-start; padding: 16px 0; }
+        .message-content { white-space: pre-wrap; word-break: break-word; }
+        .message-sender { font-size: 13px; font-weight: 500; color: var(--text-light); margin-bottom: 8px; letter-spacing: 1px; }
+        .ai .message-sender { color: var(--text-cyan); text-shadow: 0 0 10px rgba(140, 232, 255, 0.4); }
+
+        footer { padding: 0 40px 40px; display: flex; justify-content: center; }
+        .footer-inner { width: 100%; max-width: 800px; display: flex; flex-direction: column; gap: 10px; }
+        .attachment-list { display: flex; flex-wrap: wrap; gap: 8px; min-height: 0; }
+        .attachment-chip { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(140, 232, 255, 0.28); background: rgba(140, 232, 255, 0.08); color: #d7f6ff; padding: 6px 10px; border-radius: 999px; font-size: 12px; max-width: 100%; }
+        .attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+        .attachment-remove { border: none; background: transparent; color: rgba(215, 246, 255, 0.9); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
+        .attachment-remove:hover { color: #ffffff; }
+        .attach-btn.active { color: var(--text-cyan); box-shadow: 0 0 12px rgba(140, 232, 255, 0.25) inset; }
+        .attach-btn:disabled, .send-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .hidden-attachment-input { display: none; }
+        .input-box { width: 100%; max-width: 800px; background-color: rgba(10, 15, 25, 0.6); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; display: flex; align-items: flex-end; padding: 12px 16px; transition: all 0.3s ease; box-shadow: 0 10px 40px rgba(0,0,0,0.8); }
+        .input-box:focus-within { border-color: rgba(140, 232, 255, 0.4); box-shadow: 0 0 20px rgba(140, 232, 255, 0.1), 0 10px 40px rgba(0,0,0,0.8); background-color: rgba(15, 20, 35, 0.7); }
+        .attach-btn, .send-btn { background: none; border: none; cursor: pointer; padding: 10px; border-radius: 12px; color: rgba(255,255,255,0.4); display: flex; justify-content: center; align-items: center; transition: all 0.2s ease; flex-shrink: 0; margin-bottom: 2px; }
+        .attach-btn:hover, .send-btn:hover { background-color: rgba(255,255,255,0.08); color: var(--text-white); }
+        textarea { flex: 1; border: none; outline: none; resize: none; max-height: 200px; min-height: 24px; padding: 10px 16px; font-size: 15px; font-family: inherit; background: transparent; color: var(--text-white); line-height: 1.5; letter-spacing: 0.5px; }
+        textarea::placeholder { color: rgba(255, 255, 255, 0.2); }
+        .icon-svg { width: 22px; height: 22px; fill: currentColor; }
+        .chat-container:not(:empty) ~ .welcome-screen { display: none; }
+
+        /* --- 设置面板模态框 --- */
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.6); backdrop-filter: blur(8px); z-index: 100; display: none; justify-content: center; align-items: center; opacity: 0; transition: opacity 0.3s ease; }
+        .modal-overlay.active { display: flex; opacity: 1; }
+        .settings-modal { background: rgba(15, 20, 30, 0.85); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 30px; width: 400px; box-shadow: 0 20px 50px rgba(0,0,0,0.8), 0 0 30px rgba(140,232,255,0.05); color: white; transform: translateY(-20px); transition: transform 0.3s ease; }
+        .modal-overlay.active .settings-modal { transform: translateY(0); }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; font-size: 18px; font-weight: 500; letter-spacing: 1px;}
+        .close-btn { background: none; border: none; color: #8b949e; cursor: pointer; font-size: 24px; padding: 0; line-height: 1; }
+        .close-btn:hover { color: white; }
+        .setting-group { margin-bottom: 20px; display: flex; flex-direction: column; gap: 10px; }
+        .setting-group label { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+        .custom-select, .custom-input { background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1); color: white; padding: 12px 16px; border-radius: 8px; font-size: 15px; outline: none; transition: border-color 0.2s; }
+        .custom-select { cursor: pointer; }
+        .custom-select:focus, .custom-input:focus { border-color: rgba(140,232,255,0.5); }
+        .custom-select option { background: #0f141e; color: white; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 2px; }
+    </style>
+</head>
+<body>
+
+    <div id="vanta-bg"></div>
+
+    <div class="app-container">
+        <aside>
+            <button class="new-chat-btn" id="ui-new-chat">
+                <svg class="icon-svg" viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                <span>新建智能案卷</span>
+            </button>
+            <div class="history-title" id="ui-history-title">智能对话历史</div>
+            <ul class="history-list" id="history-list"></ul>
+        </aside>
+
+        <div class="main-content">
+            <header>
+                <div class="logo-container">
+                    <img src="logo.jpg" alt="汉盛律师 Logo">
+                </div>
+                <div class="header-right">
+                    <button class="settings-btn" id="open-settings" title="系统设置">
+                        <svg class="icon-svg" viewBox="0 0 24 24"><path d="M19.14,12.94c0.04-0.3,0.06-0.61,0.06-0.94c0-0.32-0.02-0.64-0.06-0.94l2.03-1.58c0.18-0.14,0.23-0.41,0.12-0.61 l-1.92-3.32c-0.12-0.22-0.37-0.29-0.59-0.22l-2.39,0.96c-0.5-0.38-1.03-0.7-1.62-0.94L14.4,2.81c-0.04-0.24-0.24-0.41-0.48-0.41 h-3.84c-0.24,0-0.43,0.17-0.47,0.41L9.25,5.35C8.66,5.59,8.12,5.92,7.63,6.29L5.24,5.33c-0.22-0.08-0.47,0-0.59,0.22L2.73,8.87 C2.62,9.08,2.66,9.34,2.86,9.48l2.03,1.58C4.84,11.36,4.8,11.69,4.8,12s0.02,0.64,0.06,0.94l-2.03,1.58 c-0.18,0.14-0.23,0.41-0.12,0.61l1.92,3.32c0.12,0.22,0.37,0.29,0.59,0.22l2.39-0.96c0.5,0.38,1.03,0.7,1.62,0.94l0.36,2.54 c0.05,0.24,0.24,0.41,0.48,0.41h3.84c0.24,0,0.43-0.17,0.47-0.41l0.36-2.54c0.59-0.24,1.13-0.56,1.62-0.94l2.39,0.96 c0.22,0.08,0.47,0,0.59-0.22l1.92-3.32c0.12-0.22,0.07-0.49-0.12-0.61L19.14,12.94z M12,15.6c-1.98,0-3.6-1.62-3.6-3.6 s1.62-3.6,3.6-3.6s3.6,1.62,3.6,3.6S13.98,15.6,12,15.6z"/></svg>
+                    </button>
+                    <div class="user-avatar" id="header-avatar">王</div>
+                </div>
+            </header>
+
+            <main id="chat-box">
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="stellar-greeting" id="main-greeting">你好，王律师</div>
+                    <div class="stellar-subtext" id="ui-subtext">Empowering Your Business with Artificial Intelligence</div>
+                </div>
+
+                <div class="chat-container" id="chat-container"></div>
+            </main>
+
+            <footer>
+                <div class="footer-inner">
+                    <div class="attachment-list" id="attachment-list"></div>
+                    <div class="input-box">
+                        <button class="attach-btn" id="attach-btn" title="上传附件"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5a2.5 2.5 0 0 1 5 0v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v11.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-1.66-1.34-3-3-3S9 3.34 9 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"/></svg></button>
+                        <textarea id="user-input" rows="1" placeholder="输入案情或法律问题，启动 Gemini Pro 星尘引擎..."></textarea>
+                        <button class="send-btn" id="send-btn"><svg class="icon-svg" viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"></path></svg></button>
+                    </div>
+                    <input id="attachment-input" class="hidden-attachment-input" type="file" multiple accept=".txt,.md,.csv,.json,.pdf,.png,.jpg,.jpeg,.webp,text/plain,text/markdown,text/csv,application/json,application/pdf,image/png,image/jpeg,image/webp">
+                </div>
+            </footer>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="settings-overlay">
+        <div class="settings-modal">
+            <div class="modal-header">
+                <span id="ui-settings-title">系统设置 (Settings)</span>
+                <button class="close-btn" id="close-settings">&times;</button>
+            </div>
+            
+            <div class="setting-group">
+                <label id="ui-account-label">切换登录账号 (Switch Account)</label>
+                <select class="custom-select" id="account-select">
+                    <option value="wang">王律师 (Wang) - 诉讼部</option>
+                    <option value="jay">Jay - 国际仲裁部</option>
+                </select>
+            </div>
+
+            <div class="setting-group">
+                <label id="ui-name-label">修改当前名称 (Edit Display Name)</label>
+                <input type="text" class="custom-input" id="name-input" placeholder="输入新的显示名称">
+            </div>
+
+            <div class="setting-group">
+                <label id="ui-lang-label">界面语言 (Language)</label>
+                <select class="custom-select" id="lang-select">
+                    <option value="zh">中文 (Chinese)</option>
+                    <option value="en">English</option>
+                </select>
+            </div>
+
+            <div class="setting-group">
+                <label id="ui-model-label">模型选择 (Model)</label>
+                <select class="custom-select" id="model-select">
+                    <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                    <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 初始化背景特效 ---
+        window.addEventListener('DOMContentLoaded', () => {
+            try {
+                VANTA.WAVES({
+                    el: "#vanta-bg",
+                    mouseControls: true, touchControls: true, gyroControls: false,
+                    minHeight: 200.00, minWidth: 200.00, scale: 1.00, scaleMobile: 1.00,
+                    color: 0x051a30, shininess: 40.00, waveHeight: 15.00, waveSpeed: 0.60, zoom: 0.85
+                });
+            } catch (error) {
+                console.log("背景加载失败", error);
+                document.getElementById('vanta-bg').style.background = 'linear-gradient(120deg, #03050a, #0d1b2a)';
+            }
+        });
+
+        // --- 核心状态与数据管理 ---
+        const teamData = {
+            "wang": { nameZh: "王律师", nameEn: "Attorney Wang", avatar: "王" },
+            "jay": { nameZh: "Jay", nameEn: "Jay", avatar: "J" }
+        };
+
+        let currentUser = "wang";
+        let currentLang = "zh";
+        const CHAT_STORAGE_KEY = "hansheng-chat-history-v1";
+        const MODEL_STORAGE_KEY = "hansheng-model-v1";
+        const LEGACY_API_BASE_STORAGE_KEY = "hansheng-api-base-v1";
+        const SUPPORTED_MODELS = ["gemini-2.5-pro", "gemini-2.5-flash"];
+        const DEFAULT_MODEL = "gemini-2.5-pro";
+
+        // 多语言词典
+        const i18n = {
+            zh: {
+                newChat: "新建智能案卷",
+                historyTitle: "智能对话历史",
+                placeholder: "输入案情或法律问题...",
+                settings: "系统设置",
+                account: "切换登录账号",
+                editName: "修改当前名称",
+                lang: "界面语言",
+                model: "模型选择",
+                emptyHistory: "暂无历史对话",
+                quotaError: "当前模型配额不足，建议切换到 Gemini 2.5 Flash 或稍后重试。",
+                networkError: "后端到 Gemini 网络请求失败（可能代理不可达）。请检查 HTTPS_PROXY 配置。",
+                timeoutError: "请求超时，请稍后重试。",
+                modelUnavailable: "当前模型不可用，请切换模型后重试。"
+            },
+            en: {
+                newChat: "New Smart Case",
+                historyTitle: "Chat History",
+                placeholder: "Describe the case or legal issue...",
+                settings: "System Settings",
+                account: "Switch Account",
+                editName: "Edit Display Name",
+                lang: "Language",
+                model: "Model",
+                emptyHistory: "No conversation history",
+                quotaError: "Model quota exceeded. Switch to Gemini 2.5 Flash or try again later.",
+                networkError: "Network request to Gemini failed (proxy may be unavailable). Check HTTPS_PROXY.",
+                timeoutError: "Request timed out. Please try again.",
+                modelUnavailable: "Selected model is unavailable. Please switch model and retry."
+            }
+        };
+
+        // DOM 元素引用
+        const elements = {
+            avatar: document.getElementById('header-avatar'),
+            greeting: document.getElementById('main-greeting'),
+            historyList: document.getElementById('history-list'),
+            inputBox: document.getElementById('user-input'),
+            nameInput: document.getElementById('name-input'),
+            
+            uiNewChat: document.querySelector('#ui-new-chat span'),
+            uiHistoryTitle: document.getElementById('ui-history-title'),
+            uiSettingsTitle: document.getElementById('ui-settings-title'),
+            uiAccountLabel: document.getElementById('ui-account-label'),
+            uiNameLabel: document.getElementById('ui-name-label'),
+            uiLangLabel: document.getElementById('ui-lang-label'),
+            uiModelLabel: document.getElementById('ui-model-label'),
+            modelSelect: document.getElementById('model-select')
+        };
+
+        function normalizeModel(rawModel) {
+            const value = String(rawModel || '').trim();
+            return SUPPORTED_MODELS.includes(value) ? value : DEFAULT_MODEL;
+        }
+
+        function readSelectedModel() {
+            try {
+                return normalizeModel(localStorage.getItem(MODEL_STORAGE_KEY) || DEFAULT_MODEL);
+            } catch (error) {
+                console.warn('读取模型配置失败', error);
+                return DEFAULT_MODEL;
+            }
+        }
+
+        function writeSelectedModel(rawModel) {
+            const normalized = normalizeModel(rawModel);
+            try {
+                localStorage.setItem(MODEL_STORAGE_KEY, normalized);
+            } catch (error) {
+                console.warn('保存模型配置失败', error);
+            }
+            return normalized;
+        }
+
+        function buildBackendChatUrls() {
+            const isFileMode = window.location.protocol === 'file:';
+            const isLocalWebHost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
+            const endpoints = [];
+
+            if (isFileMode) {
+                endpoints.push('http://localhost:3000/api/chat');
+            } else {
+                endpoints.push(`${window.location.origin}/api/chat`);
+                if (isLocalWebHost) {
+                    endpoints.push('http://localhost:3000/api/chat');
+                }
+            }
+
+            return [...new Set(endpoints.filter(Boolean))];
+        }
+
+        // 清理旧版错误后端地址缓存，避免继续命中无效 endpoint
+        try {
+            localStorage.removeItem(LEGACY_API_BASE_STORAGE_KEY);
+        } catch (error) {
+            console.warn('清理旧后端地址缓存失败', error);
+        }
+
+        function createEmptyUserChatState() {
+            return {
+                activeConversationId: '',
+                conversations: []
+            };
+        }
+
+        function loadChatState() {
+            try {
+                const raw = localStorage.getItem(CHAT_STORAGE_KEY);
+                if (!raw) return {};
+                const parsed = JSON.parse(raw);
+                if (!parsed || typeof parsed !== 'object') return {};
+                return parsed;
+            } catch (error) {
+                console.warn('聊天历史读取失败，将重置', error);
+                return {};
+            }
+        }
+
+        const chatState = loadChatState();
+
+        function saveChatState() {
+            try {
+                localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatState));
+            } catch (error) {
+                console.warn('聊天历史保存失败', error);
+            }
+        }
+
+        function getUserChatState(userId) {
+            if (!chatState[userId] || typeof chatState[userId] !== 'object') {
+                chatState[userId] = createEmptyUserChatState();
+            }
+            if (!Array.isArray(chatState[userId].conversations)) {
+                chatState[userId].conversations = [];
+            }
+            if (typeof chatState[userId].activeConversationId !== 'string') {
+                chatState[userId].activeConversationId = '';
+            }
+            return chatState[userId];
+        }
+
+        function getConversationTitleFromText(text) {
+            const source = String(text || '').split('\n')[0].trim();
+            if (!source) return currentLang === 'zh' ? '新建智能案卷' : 'New Smart Case';
+            return source.length > 26 ? `${source.slice(0, 26)}...` : source;
+        }
+
+        function createConversation(seedText = '') {
+            const now = Date.now();
+            return {
+                id: `cv_${now}_${Math.random().toString(36).slice(2, 8)}`,
+                title: getConversationTitleFromText(seedText),
+                messages: [],
+                createdAt: now,
+                updatedAt: now
+            };
+        }
+
+        function getActiveConversation() {
+            const userState = getUserChatState(currentUser);
+            if (!userState.activeConversationId) return null;
+            return userState.conversations.find((conversation) => conversation.id === userState.activeConversationId) || null;
+        }
+
+        function ensureActiveConversation() {
+            const existing = getActiveConversation();
+            if (existing) return existing;
+
+            const userState = getUserChatState(currentUser);
+            const conversation = createConversation('');
+            userState.conversations.unshift(conversation);
+            userState.activeConversationId = conversation.id;
+            saveChatState();
+            return conversation;
+        }
+
+        function setActiveConversation(conversationId) {
+            const userState = getUserChatState(currentUser);
+            const found = userState.conversations.find((conversation) => conversation.id === conversationId);
+            if (!found) return;
+            userState.activeConversationId = found.id;
+            saveChatState();
+        }
+
+        function createNewConversation() {
+            const userState = getUserChatState(currentUser);
+            const conversation = createConversation('');
+            userState.conversations.unshift(conversation);
+            userState.activeConversationId = conversation.id;
+            saveChatState();
+            return conversation;
+        }
+
+        function sortConversationsByUpdatedAt(userState) {
+            userState.conversations.sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+        }
+
+        function addMessageToConversation(conversationId, role, content) {
+            const userState = getUserChatState(currentUser);
+            const conversation = userState.conversations.find((item) => item.id === conversationId);
+            if (!conversation) return;
+
+            conversation.messages.push({
+                role,
+                content: String(content || ''),
+                createdAt: Date.now()
+            });
+            conversation.updatedAt = Date.now();
+
+            if (role === 'user' && conversation.messages.filter((message) => message.role === 'user').length === 1) {
+                conversation.title = getConversationTitleFromText(content);
+            }
+
+            sortConversationsByUpdatedAt(userState);
+            saveChatState();
+        }
+
+        function setWelcomeVisible(visible) {
+            if (visible) {
+                welcomeScreen.style.display = 'flex';
+                welcomeScreen.style.opacity = '1';
+            } else {
+                welcomeScreen.style.display = 'none';
+                welcomeScreen.style.opacity = '0';
+            }
+        }
+
+        function renderConversationMessages() {
+            if (!chatContainer) return;
+            chatContainer.innerHTML = '';
+
+            const conversation = getActiveConversation();
+            if (!conversation || !Array.isArray(conversation.messages) || conversation.messages.length === 0) {
+                setWelcomeVisible(true);
+                return;
+            }
+
+            setWelcomeVisible(false);
+            conversation.messages.forEach((message) => {
+                if (message.role === 'user') {
+                    appendUserMessage(message.content);
+                } else {
+                    appendAiMessage(message.content);
+                }
+            });
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        function renderHistoryList() {
+            const userState = getUserChatState(currentUser);
+            sortConversationsByUpdatedAt(userState);
+            elements.historyList.innerHTML = '';
+
+            if (userState.conversations.length === 0) {
+                const empty = document.createElement('li');
+                empty.className = 'history-empty';
+                empty.textContent = i18n[currentLang].emptyHistory;
+                elements.historyList.appendChild(empty);
+                return;
+            }
+
+            userState.conversations.forEach((conversation) => {
+                const li = document.createElement('li');
+                li.className = 'history-item';
+                if (conversation.id === userState.activeConversationId) {
+                    li.classList.add('active');
+                }
+                li.textContent = conversation.title || (currentLang === 'zh' ? '未命名会话' : 'Untitled conversation');
+                li.addEventListener('click', () => {
+                    setActiveConversation(conversation.id);
+                    if (typeof pendingAttachments !== 'undefined') {
+                        pendingAttachments = [];
+                        renderAttachmentList();
+                    }
+                    renderHistoryList();
+                    renderConversationMessages();
+                });
+                elements.historyList.appendChild(li);
+            });
+        }
+
+        // --- 渲染 UI (处理名称、语言、记录联动) ---
+        function renderUI() {
+            const user = teamData[currentUser];
+            const text = i18n[currentLang];
+            const currentName = currentLang === 'zh' ? user.nameZh : user.nameEn;
+
+            // 1. 同步问候语与头像
+            elements.greeting.textContent = currentLang === 'zh' ? `你好，${currentName}` : `Hello, ${currentName}`;
+            elements.avatar.textContent = user.avatar;
+            elements.nameInput.value = currentName; // 同步名称输入框内容
+
+            // 2. 渲染静态 UI 文本
+            elements.uiNewChat.textContent = text.newChat;
+            elements.uiHistoryTitle.textContent = text.historyTitle;
+            elements.inputBox.placeholder = text.placeholder;
+            elements.uiSettingsTitle.textContent = text.settings;
+            elements.uiAccountLabel.textContent = text.account;
+            elements.uiNameLabel.textContent = text.editName;
+            elements.uiLangLabel.textContent = text.lang;
+            elements.uiModelLabel.textContent = text.model;
+            elements.modelSelect.value = readSelectedModel();
+
+            // 3. 渲染动态会话内容
+            renderHistoryList();
+            renderConversationMessages();
+        }
+
+        // --- 交互逻辑 ---
+
+        // 1. 设置面板的开关
+        const modalOverlay = document.getElementById('settings-overlay');
+        document.getElementById('open-settings').addEventListener('click', () => modalOverlay.classList.add('active'));
+        document.getElementById('close-settings').addEventListener('click', () => modalOverlay.classList.remove('active'));
+        modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) modalOverlay.classList.remove('active'); });
+
+        // 2. 新建会话
+        document.getElementById('ui-new-chat').addEventListener('click', () => {
+            createNewConversation();
+            if (typeof pendingAttachments !== 'undefined') {
+                pendingAttachments = [];
+                renderAttachmentList();
+            }
+            renderHistoryList();
+            renderConversationMessages();
+            inputField.focus();
+        });
+
+        // 3. 切换账号事件
+        document.getElementById('account-select').addEventListener('change', (e) => {
+            currentUser = e.target.value;
+            if (typeof pendingAttachments !== 'undefined') {
+                pendingAttachments = [];
+                renderAttachmentList();
+            }
+            renderUI();
+        });
+
+        // 4. 切换语言事件
+        document.getElementById('lang-select').addEventListener('change', (e) => {
+            currentLang = e.target.value;
+            renderUI();
+        });
+
+        elements.modelSelect.addEventListener('change', (e) => {
+            const selected = writeSelectedModel(e.target.value);
+            elements.modelSelect.value = selected;
+        });
+
+        // 5. 修改名称事件 (即刻生效)
+        elements.nameInput.addEventListener('input', (e) => {
+            const newName = e.target.value.trim();
+            if (newName) {
+                // 更新当前用户的数据
+                teamData[currentUser].nameZh = newName;
+                teamData[currentUser].nameEn = newName;
+                // 更新头像首字母 (如果英文名则取首字母，中文名可取第一个字)
+                teamData[currentUser].avatar = newName.charAt(0);
+                
+                // 实时更新主页问候语和右上角头像
+                elements.greeting.textContent = currentLang === 'zh' ? `你好，${newName}` : `Hello, ${newName}`;
+                elements.avatar.textContent = teamData[currentUser].avatar;
+            }
+        });
+
+        // 6. 聊天功能交互
+        const inputField = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        const attachBtn = document.getElementById('attach-btn');
+        const attachmentInput = document.getElementById('attachment-input');
+        const attachmentList = document.getElementById('attachment-list');
+        const welcomeScreen = document.getElementById('welcome-screen');
+        const chatContainer = document.getElementById('chat-container');
+        const chatBox = document.getElementById('chat-box');
+        const MAX_ATTACHMENTS = 4;
+        const MAX_FILE_SIZE_BYTES = 6 * 1024 * 1024;
+        const MAX_TEXT_ATTACHMENT_CHARS = 120000;
+        const TEXT_MIME_TYPES = new Set(['text/plain', 'text/markdown', 'text/csv', 'application/json']);
+        const BINARY_MIME_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp']);
+        let pendingAttachments = [];
+
+        inputField.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = `${this.scrollHeight}px`;
+        });
+
+        function inferMimeType(file) {
+            const type = (file.type || '').toLowerCase();
+            if (type) return type;
+
+            const name = (file.name || '').toLowerCase();
+            if (name.endsWith('.txt')) return 'text/plain';
+            if (name.endsWith('.md')) return 'text/markdown';
+            if (name.endsWith('.csv')) return 'text/csv';
+            if (name.endsWith('.json')) return 'application/json';
+            if (name.endsWith('.pdf')) return 'application/pdf';
+            if (name.endsWith('.png')) return 'image/png';
+            if (name.endsWith('.jpg') || name.endsWith('.jpeg')) return 'image/jpeg';
+            if (name.endsWith('.webp')) return 'image/webp';
+            return '';
+        }
+
+        function isTextAttachment(file, mimeType) {
+            if (TEXT_MIME_TYPES.has(mimeType)) return true;
+            return mimeType.startsWith('text/');
+        }
+
+        function isBinaryAttachment(mimeType) {
+            return BINARY_MIME_TYPES.has(mimeType);
+        }
+
+        function formatSize(bytes) {
+            if (!Number.isFinite(bytes) || bytes <= 0) return '0KB';
+            return `${(bytes / 1024).toFixed(1)}KB`;
+        }
+
+        function attachmentKey(file) {
+            return `${file.name}-${file.size}-${file.lastModified}`;
+        }
+
+        function renderAttachmentList() {
+            attachmentList.innerHTML = '';
+
+            pendingAttachments.forEach((file, index) => {
+                const chip = document.createElement('div');
+                chip.className = 'attachment-chip';
+
+                const name = document.createElement('span');
+                name.className = 'attachment-name';
+                name.textContent = `${file.name} (${formatSize(file.size)})`;
+
+                const removeBtn = document.createElement('button');
+                removeBtn.className = 'attachment-remove';
+                removeBtn.type = 'button';
+                removeBtn.textContent = 'x';
+                removeBtn.addEventListener('click', () => {
+                    pendingAttachments = pendingAttachments.filter((_, idx) => idx !== index);
+                    renderAttachmentList();
+                });
+
+                chip.appendChild(name);
+                chip.appendChild(removeBtn);
+                attachmentList.appendChild(chip);
+            });
+
+            attachBtn.classList.toggle('active', pendingAttachments.length > 0);
+        }
+
+        function addAttachments(files) {
+            const errors = [];
+            const knownKeys = new Set(pendingAttachments.map(attachmentKey));
+
+            for (const file of files) {
+                if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+                    errors.push(`最多只能上传 ${MAX_ATTACHMENTS} 个附件`);
+                    break;
+                }
+
+                if (knownKeys.has(attachmentKey(file))) {
+                    continue;
+                }
+
+                if (file.size > MAX_FILE_SIZE_BYTES) {
+                    errors.push(`${file.name} 超过 6MB 限制`);
+                    continue;
+                }
+
+                const mimeType = inferMimeType(file);
+                if (!isTextAttachment(file, mimeType) && !isBinaryAttachment(mimeType)) {
+                    errors.push(`${file.name} 类型不支持，请使用 txt/md/csv/json/pdf/png/jpg/webp`);
+                    continue;
+                }
+
+                pendingAttachments.push(file);
+                knownKeys.add(attachmentKey(file));
+            }
+
+            if (errors.length > 0) {
+                alert(errors.join('\n'));
+            }
+            renderAttachmentList();
+        }
+
+        function fileToBase64(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const result = String(reader.result || '');
+                    const base64 = result.includes(',') ? result.split(',')[1] : result;
+                    if (!base64) {
+                        reject(new Error(`文件 ${file.name} 编码失败`));
+                        return;
+                    }
+                    resolve(base64);
+                };
+                reader.onerror = () => reject(new Error(`文件 ${file.name} 读取失败`));
+                reader.readAsDataURL(file);
+            });
+        }
+
+        async function serializeAttachment(file) {
+            const mimeType = inferMimeType(file) || 'application/octet-stream';
+            if (isTextAttachment(file, mimeType)) {
+                let text = await file.text();
+                if (text.length > MAX_TEXT_ATTACHMENT_CHARS) {
+                    text = text.slice(0, MAX_TEXT_ATTACHMENT_CHARS);
+                }
+                return {
+                    name: file.name,
+                    mimeType,
+                    text
+                };
+            }
+
+            return {
+                name: file.name,
+                mimeType,
+                data: await fileToBase64(file)
+            };
+        }
+
+        async function buildAttachmentPayload(attachments) {
+            return Promise.all(attachments.map((file) => serializeAttachment(file)));
+        }
+
+        function hideWelcomeScreen() {
+            if (welcomeScreen.style.display !== 'none') {
+                welcomeScreen.style.opacity = '0';
+                setTimeout(() => { welcomeScreen.style.display = 'none'; }, 500);
+            }
+        }
+
+        function appendUserMessage(text) {
+            const userMessage = document.createElement('div');
+            userMessage.className = 'message user';
+            const content = document.createElement('div');
+            content.className = 'message-content';
+            content.textContent = text;
+            userMessage.appendChild(content);
+            chatContainer.appendChild(userMessage);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        function appendAiMessage(contentText) {
+            const aiMessage = document.createElement('div');
+            aiMessage.className = 'message ai';
+
+            const sender = document.createElement('div');
+            sender.className = 'message-sender';
+            sender.textContent = '汉盛星尘引擎 v2.0';
+
+            const content = document.createElement('div');
+            content.className = 'message-content';
+            content.textContent = contentText;
+
+            aiMessage.appendChild(sender);
+            aiMessage.appendChild(content);
+            chatContainer.appendChild(aiMessage);
+            chatBox.scrollTop = chatBox.scrollHeight;
+            return content;
+        }
+
+        function buildUserPreview(text, attachments) {
+            const lines = [];
+            if (text) {
+                lines.push(text);
+            } else {
+                lines.push('（仅上传附件）');
+            }
+
+            if (attachments.length > 0) {
+                lines.push(`附件：${attachments.map((file) => file.name).join('、')}`);
+            }
+            return lines.join('\n');
+        }
+
+        async function requestGemini(text, attachments) {
+            let lastError = '后端连接失败，请确认服务已启动';
+            const attachmentPayload = await buildAttachmentPayload(attachments);
+            const backendUrls = buildBackendChatUrls();
+            const selectedModel = readSelectedModel();
+
+            for (let i = 0; i < backendUrls.length; i++) {
+                const endpoint = backendUrls[i];
+                const isLastEndpoint = i === backendUrls.length - 1;
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 45000);
+
+                try {
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: text, attachments: attachmentPayload, model: selectedModel }),
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeout);
+
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        if (data.errorCode === 'UPSTREAM_QUOTA_EXCEEDED') {
+                            lastError = i18n[currentLang].quotaError;
+                        } else if (data.errorCode === 'UPSTREAM_NETWORK_ERROR') {
+                            lastError = i18n[currentLang].networkError;
+                        } else if (data.errorCode === 'UPSTREAM_TIMEOUT') {
+                            lastError = i18n[currentLang].timeoutError;
+                        } else if (data.errorCode === 'UPSTREAM_MODEL_NOT_AVAILABLE') {
+                            lastError = i18n[currentLang].modelUnavailable;
+                        } else {
+                            lastError = data.error || data.message || `请求失败（${response.status}）`;
+                        }
+                        if (!isLastEndpoint && response.status === 404) {
+                            continue;
+                        }
+                        throw new Error(lastError);
+                    }
+
+                    const reply = typeof data.reply === 'string' ? data.reply.trim() : '';
+                    if (!reply) {
+                        throw new Error('后端返回为空，请稍后重试');
+                    }
+
+                    return reply;
+                } catch (error) {
+                    lastError = error.message || lastError;
+                    if (/load failed|failed to fetch|networkerror|network request failed/i.test(lastError)) {
+                        lastError = `无法连接后端服务（${endpoint}），请确认后端已启动。`;
+                    } else if (/aborted|timeout/i.test(lastError)) {
+                        lastError = i18n[currentLang].timeoutError;
+                    }
+                    const networkLikeError = /failed to fetch|load failed|networkerror|网络|network/i.test(lastError);
+                    if (!isLastEndpoint && networkLikeError) {
+                        continue;
+                    }
+                    throw new Error(lastError);
+                } finally {
+                    clearTimeout(timeout);
+                }
+            }
+
+            throw new Error(lastError);
+        }
+
+        async function sendMessage() {
+            const text = inputField.value.trim();
+            const attachmentsSnapshot = [...pendingAttachments];
+            if (!text && attachmentsSnapshot.length === 0) return;
+            const activeConversation = ensureActiveConversation();
+            const userPreview = buildUserPreview(text, attachmentsSnapshot);
+
+            hideWelcomeScreen();
+            appendUserMessage(userPreview);
+            addMessageToConversation(activeConversation.id, 'user', userPreview);
+            renderHistoryList();
+
+            inputField.value = '';
+            inputField.style.height = 'auto';
+            inputField.disabled = true;
+            sendBtn.disabled = true;
+            attachBtn.disabled = true;
+            attachmentInput.disabled = true;
+            attachmentList.style.pointerEvents = 'none';
+
+            const aiContentNode = appendAiMessage('正在通过 Gemini 生成法律分析，请稍候...');
+            try {
+                const reply = await requestGemini(text, attachmentsSnapshot);
+                aiContentNode.textContent = reply;
+                addMessageToConversation(activeConversation.id, 'ai', reply);
+                pendingAttachments = [];
+                renderAttachmentList();
+                renderHistoryList();
+            } catch (error) {
+                const errorMessage = `调用失败：${error.message}`;
+                aiContentNode.textContent = errorMessage;
+                addMessageToConversation(activeConversation.id, 'ai', errorMessage);
+                renderHistoryList();
+            } finally {
+                inputField.disabled = false;
+                sendBtn.disabled = false;
+                attachBtn.disabled = false;
+                attachmentInput.disabled = false;
+                attachmentList.style.pointerEvents = 'auto';
+                inputField.focus();
+                chatBox.scrollTop = chatBox.scrollHeight;
+            }
+        }
+
+        attachBtn.addEventListener('click', () => attachmentInput.click());
+        attachmentInput.addEventListener('change', (event) => {
+            const files = Array.from(event.target.files || []);
+            if (files.length > 0) {
+                addAttachments(files);
+            }
+            attachmentInput.value = '';
+        });
+
+        sendBtn.addEventListener('click', sendMessage);
+        inputField.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        renderAttachmentList();
+
+        // 页面启动渲染
+        renderUI();
+    </script>
+</body>
+</html>
