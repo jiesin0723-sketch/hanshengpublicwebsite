@@ -391,8 +391,8 @@
             <div class="setting-group">
                 <label id="ui-model-label">模型选择 (Model)</label>
                 <select class="custom-select" id="model-select">
-                    <option value="gemini-3.1-pro">Gemini 3.1 Pro</option>
-                    <option value="gemini-3-deep-think">Gemini 3 Deep Think</option>
+                    <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
+                    <option value="gemini-3-pro-preview">Gemini 3.0 Deep Think</option>
                     <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
                     <option value="gemma-3-1b-it">Gemma 3 1B</option>
                     <option value="gemma-3-4b-it">Gemma 3 4B</option>
@@ -467,13 +467,13 @@
         const PROFILE_STORAGE_KEY = "hansheng-user-profile-v1";
         const LEGACY_API_BASE_STORAGE_KEY = "hansheng-api-base-v1";
         const FALLBACK_MODELS = [
-            "gemini-3.1-pro",
-            "gemini-3-deep-think",
+            "gemini-3.1-pro-preview",
+            "gemini-3-pro-preview",
             "gemini-2.5-flash",
             "gemma-3-1b-it",
             "gemma-3-4b-it"
         ];
-        const DEFAULT_MODEL = "gemini-3.1-pro";
+        const DEFAULT_MODEL = "gemini-3.1-pro-preview";
         const THINKING_MODE_TIMEOUT_MS = {
             standard: 90_000,
             deep: 150_000,
@@ -715,6 +715,9 @@
         }
 
         function toPrettyModelName(modelId) {
+            const lower = String(modelId || "").toLowerCase();
+            if (lower === "gemini-3.1-pro-preview") return "Gemini 3.1 Pro";
+            if (lower === "gemini-3-pro-preview") return "Gemini 3.0 Deep Think";
             return modelId.replace(/^gemini-/i, "Gemini ").replace(/-/g, " ");
         }
 

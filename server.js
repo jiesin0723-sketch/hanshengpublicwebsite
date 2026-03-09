@@ -103,14 +103,15 @@ const CONTEXT_MAX_MESSAGES = readNonNegativeInt("CONTEXT_MAX_MESSAGES", 0);
 const CONTEXT_TTL_MS = readPositiveInt("CONTEXT_TTL_MS", 30 * 24 * 60 * 60 * 1000);
 
 const DEFAULT_ALLOWED_MODELS = [
-  "gemini-3.1-pro",
-  "gemini-3-deep-think",
+  "gemini-3.1-pro-preview",
+  "gemini-3-pro-preview",
   "gemini-2.5-flash",
+  "gemini-2.5-pro",
   "gemma-3-1b-it",
   "gemma-3-4b-it",
 ];
 const RESERVED_PAID_MODELS = parseModelList(process.env.GEMINI_RESERVED_MODELS || "", []);
-const ENV_DEFAULT_MODEL = (process.env.GEMINI_MODEL || "gemini-3.1-pro").trim();
+const ENV_DEFAULT_MODEL = (process.env.GEMINI_MODEL || "gemini-3.1-pro-preview").trim();
 const ALLOWED_MODELS = [
   ...new Set([
     ...parseModelList(process.env.GEMINI_ALLOWED_MODELS || "", DEFAULT_ALLOWED_MODELS),
@@ -118,7 +119,9 @@ const ALLOWED_MODELS = [
   ]),
 ];
 const SUPPORTED_MODELS = new Set(ALLOWED_MODELS);
-const DEFAULT_MODEL = SUPPORTED_MODELS.has(ENV_DEFAULT_MODEL) ? ENV_DEFAULT_MODEL : ALLOWED_MODELS[0] || "gemini-3.1-pro";
+const DEFAULT_MODEL = SUPPORTED_MODELS.has(ENV_DEFAULT_MODEL)
+  ? ENV_DEFAULT_MODEL
+  : ALLOWED_MODELS[0] || "gemini-3.1-pro-preview";
 
 const SUPPORTED_BINARY_MIME_TYPES = new Set([
   "application/pdf",
@@ -159,42 +162,51 @@ const USER_BY_ACCOUNT = new Map(AUTH_USERS.map((user) => [user.account, user]));
 const displayNameStore = new Map(AUTH_USERS.map((user) => [user.id, user.displayName]));
 
 const RESPONSE_STYLE_INSTRUCTION = `
-【角色设定】
-你是一位拥有超过几十年实务经验和学术经验的中国资深商事律师及仲裁员。你的工作语言为中文和英文。
+【角色定位】
+你是一位拥有十余年实务经验的中国大陆资深商事与金融诉讼律师及仲裁员。你的受众是极其专业的合伙人级别律师，你的回答必须摒弃一切废话与客套，直击法律实质。
 
-【总则】
-回答必须严谨、客观、逻辑严密。默认采用中文输出；若用户明确要求英文或双语，再切换语言。
+【工作流与分析逻辑 (强制执行 IRAC 原则)】
+在面对复杂的合同、侵权竞合或刑事合规问题时，你必须严格按照以下结构输出：
+1. **案件拆解与检索策略 (Plan)**：简要列出你为了回答此问题，需要核实的 1-3 个核心法律冲突及对应的底层法规/类案检索方向。
+2. **争议焦点 (Issue)**：精准提炼案件的核心法律冲突。
+3. **裁判规则与法理 (Rule)**：引用具体、现行有效的中国法律法规、司法解释或最高人民法院的指导性案例/公报案例。必须带有具体条文序号和生效年份。
+4. **事实适用 (Application)**：将案件事实代入上述规则，进行严密的逻辑推演。若有附件，必须优先引用附件原文。
+5. **实务结论与风险暴露 (Conclusion)**：给出清晰的倾向性结论，并务必提示诉讼/仲裁的举证风险或商业不确定性。
 
-【守则 1：法理与反幻觉绝对红线】
-所有法律分析必须严格依据现行有效的中国法律法规、司法解释及最高人民法院指导性案例/公报案例、法院公开裁判文书。
-严禁捏造法条、案号、法规名称、裁判观点。
-若对特定法条或案例无法确定，必须明确写明“目前无法确定该特定法条/案例”，不得编造。
+【不可逾越的红线】
+1. **严禁捏造 (Zero Hallucination)**：绝对不允许编造不存在的法条、案号或法院判决。如果你不确定，必须明确回答“现有检索未发现明确依据”。
+2. **强制实证**：引用网络资料、最新法规或案例时，必须在对应句末使用 Markdown 超链接标注原文来源。
+3. **排除非中国大陆法**：除非特别指令，否则禁止引用英美法系规则，必须立足于中国本土司法实践。
+`;
 
-【守则 2：案卷绝对优先原则（附件处理）】
-如存在附件，必须先引用附件中的具体条款或原文段落作为“事实依据”，再进行法律适用分析。
-禁止脱离附件内容空泛论证。若附件与问题不相关，需明确指出不相关并解释原因。
+const MODEL_SAMPLING_CONFIG = {
+  temperature: 0.1,
+  topP: 0.8,
+  topK: 40,
+};
 
-【守则 3：联网实证与精准溯源】
-涉及最新法律法规、监管动态、热点案例时，必须进行联网核验，并优先使用官方来源（人大网、最高法、政府官网等）与最新有效文本。
-引用网络资料或法规时，必须在对应句末使用 Markdown 超链接标注原文来源，确保可点击核验。
-若无法提供可核验来源链接，必须明确说明“当前无法提供可核验来源链接”。
+const PLAN_AND_SOLVE_PROMPT = `
+你当前处于 Pass 1（策略生成层），禁止调用联网工具。
+请基于用户问题与已给出的历史/附件信息，完成以下任务并仅输出 JSON：
+{
+  "plan": ["最多 3 条，描述要核实的法律冲突与检索方向"],
+  "issue": "一句话提炼核心争议焦点",
+  "searchQueries": ["3-4 条可直接用于 Google 的检索关键词，必须具体可执行"]
+}
+要求：
+1) searchQueries 必须是中文或中英混合专业检索词，禁止空泛表达；
+2) 若信息不足，需在 plan 中写明“待补充事实”；
+3) 不要输出 JSON 之外的任何内容。
+`;
 
-【守则 4：专业法律翻译标准】
-进行法律翻译时，禁止口语化表达；需使用法律专业术语并注意大陆法系与英美法系术语差异。
-对于 Equity、Consideration、惩罚性赔偿等术语，除翻译外应在括号内补充关键法律内涵，避免歧义。
-
-【守则 5：逻辑输出框架与风险隔离】
-保持中立专业语气，不使用“保证”“绝对”等承诺性措辞。
-必要时提示商业风险、诉讼/仲裁不确定性与证据不足风险。
-
-【输出结构（默认）】
-1) 结论摘要（2-5行）
-2) 事实依据（优先引用附件原文；如无附件则写“无附件事实依据”）
-3) 法律依据（法条名称+要点；若使用外部资料必须带 Markdown 链接）
-4) 法律分析
-5) 争议与风险
-6) 实务建议
-7) 待补充事实（如无则写“无”）
+const PLAN_AND_SOLVE_FINAL_PROMPT = `
+请仔细阅读前置的检索策略，系统现已为你开启联网权限。
+请针对这些拆解出的关键词进行深度搜索，交叉比对后，输出最终的 IRAC 法律意见书。
+强制要求：
+1) 结论必须可追溯到中国大陆现行有效法律法规、司法解释、指导性案例或公报案例；
+2) 每个关键外部依据必须在句末添加 Markdown 超链接；
+3) 若附件事实不足或证据链存在断裂，必须明确写出举证风险；
+4) 不得编造法条、案号或裁判观点。
 `;
 
 const WEB_SEARCH_FORCE_KEYWORDS = [
@@ -421,21 +433,39 @@ function withTimeout(promise, timeoutMs) {
 
 function normalizeErrorMessage(error) {
   const message = String(error?.message || "unknown error");
-  return message.length > 500 ? `${message.slice(0, 500)}...` : message;
+  const causeCode = String(error?.cause?.code || "").trim();
+  const causeMessage = String(error?.cause?.message || "").trim();
+  const enriched = [message, causeCode, causeMessage].filter(Boolean).join(" | ");
+  const full = enriched || message;
+  return full.length > 500 ? `${full.slice(0, 500)}...` : full;
+}
+
+function isNetworkError(error) {
+  const message = normalizeErrorMessage(error).toLowerCase();
+  return (
+    message.includes("fetch failed") ||
+    message.includes("und_err_socket") ||
+    message.includes("socketerror") ||
+    message.includes("other side closed") ||
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("network") ||
+    message.includes("proxy")
+  );
 }
 
 function isTransientError(error) {
   const raw = normalizeErrorMessage(error);
-  const message = normalizeErrorMessage(error).toLowerCase();
+  const message = raw.toLowerCase();
   return (
     message.includes("timeout") ||
     message.includes("timed out") ||
     message.includes("503") ||
     message.includes("temporarily") ||
     message.includes("unavailable") ||
-    message.includes("econnreset") ||
     message.includes("etimedout") ||
-    raw.includes("超时")
+    raw.includes("超时") ||
+    isNetworkError(error)
   );
 }
 
@@ -741,41 +771,177 @@ function primeConversationContext(context, historyMessages) {
   context.updatedAt = Date.now();
 }
 
-async function generateReplyWithRetry({ model, contents, webSearch, timeoutMs }) {
-  let lastError = null;
+function buildGenerationConfig({ webSearch }) {
+  const config = {
+    systemInstruction: RESPONSE_STYLE_INSTRUCTION,
+    ...MODEL_SAMPLING_CONFIG,
+  };
+  if (webSearch) {
+    config.tools = [{ googleSearch: {} }];
+  }
+  return config;
+}
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
+function parsePlanAndSolvePayload(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) return null;
+
+  const candidates = [text];
+  const fencedMatches = text.match(/```(?:json)?\s*([\s\S]*?)```/gi) || [];
+  for (const block of fencedMatches) {
+    const stripped = block.replace(/```(?:json)?/i, "").replace(/```$/, "").trim();
+    if (stripped) candidates.push(stripped);
+  }
+
+  for (const candidate of candidates) {
     try {
-      const config = {
-        systemInstruction: RESPONSE_STYLE_INSTRUCTION,
-      };
-      if (webSearch) {
-        config.tools = [{ googleSearch: {} }];
-      }
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 
-      const response = await withTimeout(
-        ai.models.generateContent({
+function extractSearchQueries(rawText, userMessage) {
+  const parsed = parsePlanAndSolvePayload(rawText);
+  let queries = [];
+
+  if (parsed && Array.isArray(parsed.searchQueries)) {
+    queries = parsed.searchQueries;
+  } else {
+    const lines = String(rawText || "").split(/\r?\n/);
+    for (const line of lines) {
+      const cleaned = line
+        .replace(/^\s*[-*•]\s*/, "")
+        .replace(/^\s*\d+[.)、]\s*/, "")
+        .trim();
+      if (cleaned.length >= 8) {
+        queries.push(cleaned);
+      }
+    }
+  }
+
+  const normalized = [...new Set(queries.map((item) => String(item || "").trim()).filter(Boolean))].slice(0, 4);
+  if (normalized.length >= 3) return normalized;
+
+  const topic = String(userMessage || "").replace(/\s+/g, " ").trim().slice(0, 32) || "争议事项";
+  const fallback = [
+    `${topic} 最高人民法院 指导性案例`,
+    `${topic} 民法典 司法解释`,
+    `${topic} 裁判文书 责任认定`,
+  ];
+  return [...new Set([...normalized, ...fallback])].slice(0, 4);
+}
+
+function buildPlanPassContents(contents) {
+  return [
+    ...contents,
+    { role: "user", parts: [{ text: PLAN_AND_SOLVE_PROMPT }] },
+  ];
+}
+
+function buildFinalPassContents({ contents, strategyText, searchQueries }) {
+  const queryBlock = searchQueries.map((item, index) => `${index + 1}. ${item}`).join("\n");
+  const contextText = [
+    "【Pass 1 检索策略原文】",
+    strategyText || "（无）",
+    "",
+    "【建议检索关键词】",
+    queryBlock || "1. 中国法律法规 官方来源 核验",
+    "",
+    "【Pass 2 指令】",
+    PLAN_AND_SOLVE_FINAL_PROMPT,
+  ].join("\n");
+
+  return [
+    ...contents,
+    { role: "user", parts: [{ text: contextText }] },
+  ];
+}
+
+function shouldUsePlanAndSolvePipeline({ webSearch, timeoutMs }) {
+  return Boolean(webSearch) || Number(timeoutMs) >= COMPLEX_QUESTION_MIN_TIMEOUT_MS;
+}
+
+async function callGenerateOnce({ model, contents, webSearch, timeoutMs }) {
+  const response = await withTimeout(
+    ai.models.generateContent({
+      model,
+      contents,
+      config: buildGenerationConfig({ webSearch }),
+    }),
+    timeoutMs
+  );
+
+  const reply = typeof response.text === "string" ? response.text.trim() : "";
+  if (!reply) {
+    throw new Error(`模型 ${model} 未返回有效文本`);
+  }
+  return reply;
+}
+
+async function runTwoPassPlanAndSolve({ model, contents, timeoutMs, userMessage }) {
+  const pass1Timeout = Math.max(
+    MIN_REQUEST_TIMEOUT_MS,
+    Math.min(MAX_REQUEST_TIMEOUT_MS, Math.floor(timeoutMs * 0.45))
+  );
+  const strategyText = await callGenerateOnce({
+    model,
+    contents: buildPlanPassContents(contents),
+    webSearch: false,
+    timeoutMs: pass1Timeout,
+  });
+  const searchQueries = extractSearchQueries(strategyText, userMessage);
+  const finalReply = await callGenerateOnce({
+    model,
+    contents: buildFinalPassContents({
+      contents,
+      strategyText,
+      searchQueries,
+    }),
+    webSearch: true,
+    timeoutMs,
+  });
+  return {
+    reply: finalReply,
+    model,
+    webSearchUsed: true,
+    pipeline: "TWO_PASS_PLAN_AND_SOLVE",
+    searchQueries,
+  };
+}
+
+async function generateReplyWithRetry({ model, contents, webSearch, timeoutMs, userMessage }) {
+  let lastError = null;
+  const maxAttempts = 3;
+  const usePlanAndSolve = shouldUsePlanAndSolvePipeline({ webSearch, timeoutMs });
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (usePlanAndSolve) {
+        return await runTwoPassPlanAndSolve({
           model,
           contents,
-          config,
-        }),
-        timeoutMs
-      );
-
-      const reply = typeof response.text === "string" ? response.text.trim() : "";
-      if (!reply) {
-        throw new Error(`模型 ${model} 未返回有效文本`);
+          timeoutMs,
+          userMessage,
+        });
       }
-
-      return { reply, model };
+      const reply = await callGenerateOnce({ model, contents, webSearch, timeoutMs });
+      return {
+        reply,
+        model,
+        webSearchUsed: webSearch,
+        pipeline: "SINGLE_PASS",
+        searchQueries: [],
+      };
     } catch (error) {
       lastError = error;
-      const shouldRetry = attempt < 2 && isTransientError(error);
+      const shouldRetry = attempt < maxAttempts && isTransientError(error);
       if (shouldRetry) {
-        await delay(400);
+        await delay(500 * attempt);
         continue;
       }
-      break;
     }
   }
 
@@ -833,6 +999,14 @@ async function handleChat(req, res) {
   });
 
   try {
+    const generationResult = await generateReplyWithRetry({
+      model: activeModel,
+      contents,
+      webSearch: useWebSearch,
+      timeoutMs,
+      userMessage,
+    });
+
     console.log(
       "收到前端提问：",
       userMessage || "（无文本问题）",
@@ -842,34 +1016,28 @@ async function handleChat(req, res) {
       req.authUser.id,
       "会话：",
       conversationId,
-      "请求模型：",
-      normalizeModelValue(requestedModel) || "(default)",
-      "实际模型：",
-      activeModel,
       "超时阈值(ms)：",
       timeoutMs,
-      "联网检索：",
-      useWebSearch,
       "强制检索：",
-      forceWebSearch
+      forceWebSearch,
+      `请求模型：${normalizeModelValue(requestedModel) || "(default)"}`,
+      `实际模型：${generationResult.model}`,
+      `联网检索：${generationResult.webSearchUsed}`,
+      `推理管线：${generationResult.pipeline}`,
+      `检索词数：${Array.isArray(generationResult.searchQueries) ? generationResult.searchQueries.length : 0}`
     );
 
-    const { reply, model } = await generateReplyWithRetry({
-      model: activeModel,
-      contents,
-      webSearch: useWebSearch,
-      timeoutMs,
-    });
-
     appendContextMessage(context, "user", currentUserParts);
-    appendContextMessage(context, "model", [{ text: reply }]);
+    appendContextMessage(context, "model", [{ text: generationResult.reply }]);
 
     return res.json({
       success: true,
-      reply,
-      model,
+      reply: generationResult.reply,
+      model: generationResult.model,
       attachmentCount: attachments.length,
       conversationId,
+      webSearchUsed: generationResult.webSearchUsed,
+      pipeline: generationResult.pipeline,
     });
   } catch (error) {
     const mappedError = mapUpstreamError(error);
