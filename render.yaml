@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: hansheng-gemini-site
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-pro
+      - key: TRUST_PROXY
+        value: "1"
+      - key: RATE_LIMIT_WINDOW_MS
+        value: "60000"
+      - key: RATE_LIMIT_MAX_REQUESTS
+        value: "20"
+      - key: MAX_ATTACHMENTS
+        value: "4"
