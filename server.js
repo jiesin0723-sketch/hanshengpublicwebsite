@@ -464,7 +464,7 @@ const corsOptions = {
   maxAge: 86_400,
 };
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
+app.options(/.*/, cors(corsOptions));
 app.use(express.json({ limit: `${JSON_BODY_LIMIT_MB}mb` }));
 app.use(express.static(path.join(__dirname)));
 
