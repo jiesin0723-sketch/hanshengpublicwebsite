@@ -46,6 +46,23 @@ function parseCorsOrigins(rawOrigins) {
     .filter(Boolean);
 }
 
+function matchCorsOriginByWildcard(origin, pattern) {
+  if (!origin || !pattern || !pattern.includes("*")) return false;
+  const escaped = pattern
+    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*");
+  const regex = new RegExp(`^${escaped}$`, "i");
+  return regex.test(origin);
+}
+
+function isCorsOriginAllowed(origin, allowList) {
+  if (!origin) return true;
+  if (!Array.isArray(allowList) || allowList.length === 0) return true;
+  if (allowList.includes("*")) return true;
+  if (allowList.includes(origin)) return true;
+  return allowList.some((pattern) => matchCorsOriginByWildcard(origin, pattern));
+}
+
 function normalizeHost(value) {
   return String(value || "")
     .trim()
@@ -437,23 +454,17 @@ const chatRateLimiter = createInMemoryRateLimiter({
 
 app.disable("x-powered-by");
 app.set("trust proxy", TRUST_PROXY);
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin) {
-        callback(null, true);
-        return;
-      }
-      if (ALLOWED_CORS_ORIGINS.length === 0) {
-        callback(null, true);
-        return;
-      }
-      callback(null, ALLOWED_CORS_ORIGINS.includes(origin));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+const corsOptions = {
+  origin(origin, callback) {
+    callback(null, isCorsOriginAllowed(origin, ALLOWED_CORS_ORIGINS));
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
+  optionsSuccessStatus: 204,
+  maxAge: 86_400,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json({ limit: `${JSON_BODY_LIMIT_MB}mb` }));
 app.use(express.static(path.join(__dirname)));
 
@@ -930,6 +941,20 @@ async function handleUploadPresign(req, res) {
   });
   const policy = buildOssPostPolicy({ objectKey });
   const uploadUrl = getOssUploadBaseUrl();
+  if (!uploadUrl) {
+    return res.status(500).json({
+      success: false,
+      errorCode: "OSS_UPLOAD_URL_INVALID",
+      message: "OSS 上传地址无效，请检查 OSS_ENDPOINT 配置",
+    });
+  }
+  console.log(
+    "上传签名下发:",
+    `user=${req.authUser.id}`,
+    `conversation=${conversationId}`,
+    `size=${fileSize}`,
+    `objectKey=${objectKey}`
+  );
   return res.json({
     success: true,
     mode: "oss-direct",
@@ -975,6 +1000,13 @@ async function handleUploadComplete(req, res) {
 
   try {
     const signedUrl = buildSignedOssGetUrl(objectKey, 300);
+    if (!signedUrl) {
+      return res.status(500).json({
+        success: false,
+        errorCode: "OSS_SIGN_URL_FAILED",
+        message: "无法生成 OSS 下载签名，请检查 OSS 配置",
+      });
+    }
     const downloaded = await downloadRemoteFileToTemp({
       fileUrl: signedUrl,
       expectedSize,
@@ -1006,10 +1038,25 @@ async function handleUploadComplete(req, res) {
       },
     });
   } catch (error) {
-    return res.status(500).json({
+    const detail = normalizeErrorMessage(error);
+    const isNetwork = isNetworkError(error);
+    const isTimeout = /timeout|timed out|aborted/i.test(detail);
+    console.error(
+      "OSS回填失败:",
+      `user=${req.authUser.id}`,
+      `conversation=${conversationId}`,
+      `objectKey=${objectKey}`,
+      detail
+    );
+    return res.status(isNetwork || isTimeout ? 502 : 500).json({
       success: false,
-      message: "直传文件回填失败",
-      error: normalizeErrorMessage(error),
+      errorCode: isTimeout ? "OSS_FETCH_TIMEOUT" : isNetwork ? "OSS_FETCH_NETWORK_ERROR" : "OSS_COMPLETE_FAILED",
+      message: isTimeout
+        ? "直传文件回填超时，请稍后重试"
+        : isNetwork
+        ? "后端拉取 OSS 文件失败，请检查网络和 OSS 访问策略"
+        : "直传文件回填失败",
+      error: detail,
     });
   }
 }
