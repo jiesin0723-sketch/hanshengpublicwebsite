@@ -61,7 +61,28 @@
             flex-direction: column;
             padding: 24px 20px;
             flex-shrink: 0;
+            overflow: hidden;
+            transition: width 0.28s ease, padding 0.28s ease, border-right-color 0.28s ease;
         }
+        .app-container.sidebar-collapsed aside { width: 0; padding: 24px 0; border-right-color: transparent; }
+        .app-container.sidebar-collapsed aside > * { opacity: 0; pointer-events: none; }
+
+        .sidebar-toggle-btn {
+            width: 38px;
+            height: 38px;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-white);
+            cursor: pointer;
+            font-size: 18px;
+            line-height: 1;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+        .sidebar-toggle-btn:hover { background: rgba(140, 232, 255, 0.14); border-color: rgba(140, 232, 255, 0.28); color: var(--text-cyan); }
 
         .new-chat-btn {
             background-color: rgba(255, 255, 255, 0.03);
@@ -117,6 +138,7 @@
         .logo-container {
             display: flex;
             align-items: center;
+            gap: 10px;
             background: transparent; /* 去除白底 */
         }
 
@@ -195,6 +217,18 @@
         .message-content { white-space: pre-wrap; word-break: break-word; }
         .message-sender { font-size: 13px; font-weight: 500; color: var(--text-light); margin-bottom: 8px; letter-spacing: 1px; }
         .ai .message-sender { color: var(--text-cyan); text-shadow: 0 0 10px rgba(140, 232, 255, 0.4); }
+        .message-actions { margin-top: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .message-action-btn {
+            border: 1px solid rgba(255,255,255,0.16);
+            background: rgba(255,255,255,0.06);
+            color: rgba(255,255,255,0.92);
+            border-radius: 999px;
+            padding: 6px 12px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .message-action-btn:hover { background: rgba(140,232,255,0.16); border-color: rgba(140,232,255,0.3); color: #dff9ff; }
 
         footer { padding: 0 40px 40px; display: flex; justify-content: center; }
         .footer-inner { width: 100%; max-width: 800px; display: flex; flex-direction: column; gap: 10px; }
@@ -326,6 +360,7 @@
         <div class="main-content">
             <header>
                 <div class="logo-container">
+                    <button class="sidebar-toggle-btn" id="sidebar-toggle" title="折叠历史对话栏">⟨</button>
                     <img src="logo.jpg" alt="汉盛律师 Logo">
                 </div>
                 <div class="header-right">
@@ -339,7 +374,7 @@
             <main id="chat-box">
                 <div class="welcome-screen" id="welcome-screen">
                     <div class="stellar-greeting" id="main-greeting">你好，王律师</div>
-                    <div class="stellar-subtext" id="ui-subtext">Empowering Your Business with Artificial Intelligence</div>
+                    <div class="stellar-subtext" id="ui-subtext">Future Is Now. It’s Just Not Evenly Distributed.</div>
                 </div>
 
                 <div class="chat-container" id="chat-container"></div>
@@ -474,6 +509,7 @@
         const THINKING_MODE_STORAGE_KEY = "hansheng-thinking-mode-v1";
         const AUTH_TOKEN_STORAGE_KEY = "hansheng-auth-token-v1";
         const PROFILE_STORAGE_KEY = "hansheng-user-profile-v1";
+        const SIDEBAR_COLLAPSED_STORAGE_KEY = "hansheng-sidebar-collapsed-v1";
         const LEGACY_API_BASE_STORAGE_KEY = "hansheng-api-base-v1";
         const FALLBACK_MODELS = [
             "gemini-3.1-pro-preview",
@@ -540,7 +576,12 @@
                 uploadSummary: "本轮附件：已上传 {ok}/{total}，上限 {max}",
                 uploadFailed: "上传失败",
                 uploadSuccess: "上传成功",
-                uploading: "上传中 {p}%"
+                uploading: "上传中 {p}%",
+                copyResponse: "复制本次答案",
+                exportWord: "导出为Word",
+                copySuccess: "已复制本次答案到剪贴板",
+                sidebarCollapse: "折叠历史对话栏",
+                sidebarExpand: "展开历史对话栏"
             },
             en: {
                 newChat: "New Smart Case",
@@ -570,7 +611,12 @@
                 uploadSummary: "Attachments this turn: uploaded {ok}/{total}, limit {max}",
                 uploadFailed: "Upload failed",
                 uploadSuccess: "Uploaded",
-                uploading: "Uploading {p}%"
+                uploading: "Uploading {p}%",
+                copyResponse: "Copy response",
+                exportWord: "Export to Word",
+                copySuccess: "Response copied to clipboard",
+                sidebarCollapse: "Collapse history sidebar",
+                sidebarExpand: "Expand history sidebar"
             }
         };
 
@@ -606,6 +652,7 @@
             modalOverlay: document.getElementById("settings-overlay"),
             openSettings: document.getElementById("open-settings"),
             closeSettings: document.getElementById("close-settings"),
+            sidebarToggle: document.getElementById("sidebar-toggle"),
             newChatBtn: document.getElementById("ui-new-chat"),
             inputField: document.getElementById("user-input"),
             sendBtn: document.getElementById("send-btn"),
@@ -685,6 +732,23 @@
 
         function clearAuthToken() {
             localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+        }
+
+        function readSidebarCollapsed() {
+            return localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === "1";
+        }
+
+        function writeSidebarCollapsed(collapsed) {
+            localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed ? "1" : "0");
+            return collapsed;
+        }
+
+        function applySidebarCollapsed(collapsed) {
+            elements.appRoot.classList.toggle("sidebar-collapsed", Boolean(collapsed));
+            elements.sidebarToggle.textContent = collapsed ? "⟩" : "⟨";
+            elements.sidebarToggle.title = collapsed
+                ? i18n[currentLang].sidebarExpand
+                : i18n[currentLang].sidebarCollapse;
         }
 
         function normalizeModel(rawModel) {
@@ -974,6 +1038,83 @@
             elements.chatBox.scrollTop = elements.chatBox.scrollHeight;
         }
 
+        async function copyMessageContent(text) {
+            const value = String(text || "");
+            if (!value) return;
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(value);
+                return;
+            }
+            const textarea = document.createElement("textarea");
+            textarea.value = value;
+            textarea.style.position = "fixed";
+            textarea.style.left = "-9999px";
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand("copy");
+            textarea.remove();
+        }
+
+        function exportMessageAsWord(text) {
+            const safe = String(text || "")
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/\"/g, "&quot;")
+                .replace(/'/g, "&#39;")
+                .replace(/\r?\n/g, "<br>");
+            const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>response</title></head><body style="font-family:Arial,'Microsoft YaHei',sans-serif;line-height:1.8;color:#222;">${safe}</body></html>`;
+            const blob = new Blob(["\ufeff", html], { type: "application/msword;charset=utf-8" });
+            const now = new Date();
+            const fileName = `response_${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}.doc`;
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = fileName;
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+
+        function appendAiActionButtons(aiMessage, contentNode) {
+            const actions = document.createElement("div");
+            actions.className = "message-actions";
+
+            const copyBtn = document.createElement("button");
+            copyBtn.type = "button";
+            copyBtn.className = "message-action-btn";
+            copyBtn.textContent = i18n[currentLang].copyResponse;
+            copyBtn.addEventListener("click", async () => {
+                copyBtn.disabled = true;
+                try {
+                    await copyMessageContent(contentNode.textContent || "");
+                    alert(i18n[currentLang].copySuccess);
+                } finally {
+                    copyBtn.disabled = false;
+                }
+            });
+
+            const exportBtn = document.createElement("button");
+            exportBtn.type = "button";
+            exportBtn.className = "message-action-btn";
+            exportBtn.textContent = i18n[currentLang].exportWord;
+            exportBtn.addEventListener("click", () => {
+                exportBtn.disabled = true;
+                try {
+                    exportMessageAsWord(contentNode.textContent || "");
+                } finally {
+                    setTimeout(() => {
+                        exportBtn.disabled = false;
+                    }, 250);
+                }
+            });
+
+            actions.appendChild(copyBtn);
+            actions.appendChild(exportBtn);
+            aiMessage.appendChild(actions);
+        }
+
         function appendAiMessage(contentText) {
             const aiMessage = document.createElement("div");
             aiMessage.className = "message ai";
@@ -988,6 +1129,7 @@
 
             aiMessage.appendChild(sender);
             aiMessage.appendChild(content);
+            appendAiActionButtons(aiMessage, content);
             elements.chatContainer.appendChild(aiMessage);
             elements.chatBox.scrollTop = elements.chatBox.scrollHeight;
             return content;
@@ -1062,9 +1204,7 @@
             const displayName = getDisplayName();
 
             elements.greeting.textContent = currentLang === "zh" ? `你好，${displayName}` : `Hello, ${displayName}`;
-            elements.subtext.textContent = currentLang === "zh"
-                ? "面向法律专业用户的智能检索与论证引擎"
-                : "Professional legal intelligence and argumentation assistant";
+            elements.subtext.textContent = "Future Is Now. It’s Just Not Evenly Distributed.";
             elements.avatar.textContent = getAvatarFromName(displayName);
             elements.nameInput.value = displayName;
             elements.accountDisplay.textContent = `${currentUser.account}（ID: ${currentUser.id}）`;
@@ -1085,6 +1225,7 @@
             elements.thinkingModeSelect.value = writeThinkingMode(readThinkingMode());
             elements.thinkingText.textContent = text.thinkingStatus;
             elements.thinkingEta.textContent = text.thinkingEta.replace("{s}", "--");
+            applySidebarCollapsed(readSidebarCollapsed());
 
             renderHistoryList();
             renderConversationMessages();
@@ -1249,68 +1390,159 @@
             });
         }
 
-        function uploadAttachmentItem(item, conversationId) {
+        function setUploadFailed(item, errorMessage) {
+            item.status = "error";
+            item.errorMessage = String(errorMessage || "upload failed");
+            item.xhr = null;
+            renderAttachmentList();
+        }
+
+        function applyUploadSuccess(item, attachmentId) {
+            item.status = "success";
+            item.progress = 100;
+            item.uploadId = String(attachmentId || "");
+            item.errorMessage = "";
+            item.file = null;
+            item.xhr = null;
+            renderAttachmentList();
+        }
+
+        async function uploadAttachmentViaBackend(item, conversationId) {
             const endpoint = getPrimaryApiUrl("/api/uploads");
             const formData = new FormData();
             formData.append("conversationId", conversationId);
             formData.append("file", item.file, item.name);
 
-            const xhr = new XMLHttpRequest();
-            xhr.open("POST", endpoint, true);
-            if (authToken) {
-                xhr.setRequestHeader("Authorization", `Bearer ${authToken}`);
+            await new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open("POST", endpoint, true);
+                if (authToken) {
+                    xhr.setRequestHeader("Authorization", `Bearer ${authToken}`);
+                }
+                xhr.responseType = "json";
+                xhr.timeout = 10 * 60 * 1000;
+                item.xhr = xhr;
+
+                xhr.upload.onprogress = (event) => {
+                    if (event.lengthComputable) {
+                        const percent = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+                        item.progress = percent;
+                        renderAttachmentList();
+                    }
+                };
+                xhr.onload = () => {
+                    item.xhr = null;
+                    const data = (xhr.response && typeof xhr.response === "object")
+                        ? xhr.response
+                        : safeJSONParse(xhr.responseText || "{}", {});
+                    if (xhr.status === 200 && data?.success && data?.attachment?.id) {
+                        applyUploadSuccess(item, data.attachment.id);
+                        resolve();
+                        return;
+                    }
+                    if (xhr.status === 401) {
+                        setAuthRequiredState();
+                    }
+                    reject(new Error(String(data?.message || xhr.statusText || "upload failed")));
+                };
+                xhr.onerror = () => reject(new Error("network error"));
+                xhr.ontimeout = () => reject(new Error("timeout"));
+                xhr.onabort = () => reject(new Error("aborted"));
+                xhr.send(formData);
+            });
+        }
+
+        async function uploadAttachmentViaOss(item, conversationId) {
+            const presign = await requestBackend("/api/uploads/presign", {
+                method: "POST",
+                requireAuth: true,
+                body: {
+                    conversationId,
+                    fileName: item.name,
+                    mimeType: item.mimeType,
+                    size: item.size
+                }
+            });
+            if (!presign?.success || !presign.uploadUrl || !presign.fields || !presign.objectKey) {
+                throw new Error("未获取到有效的OSS上传签名");
             }
-            xhr.responseType = "json";
-            xhr.timeout = 10 * 60 * 1000;
+
+            await new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open("POST", presign.uploadUrl, true);
+                xhr.timeout = 20 * 60 * 1000;
+                item.xhr = xhr;
+
+                xhr.upload.onprogress = (event) => {
+                    if (event.lengthComputable) {
+                        const percent = Math.max(1, Math.min(95, Math.round((event.loaded / event.total) * 100)));
+                        item.progress = percent;
+                        renderAttachmentList();
+                    }
+                };
+
+                xhr.onload = () => {
+                    item.xhr = null;
+                    if ([200, 201, 204].includes(xhr.status)) {
+                        resolve();
+                        return;
+                    }
+                    reject(new Error(`OSS上传失败（${xhr.status}）`));
+                };
+                xhr.onerror = () => reject(new Error("OSS network error"));
+                xhr.ontimeout = () => reject(new Error("OSS timeout"));
+                xhr.onabort = () => reject(new Error("OSS aborted"));
+
+                const formData = new FormData();
+                Object.entries(presign.fields || {}).forEach(([key, value]) => {
+                    formData.append(key, String(value));
+                });
+                formData.append("file", item.file, item.name);
+                xhr.send(formData);
+            });
+
+            const completeData = await requestBackend("/api/uploads/complete", {
+                method: "POST",
+                requireAuth: true,
+                timeoutMs: 180_000,
+                body: {
+                    conversationId,
+                    objectKey: presign.objectKey,
+                    fileName: item.name,
+                    mimeType: item.mimeType,
+                    size: item.size
+                }
+            });
+            if (!completeData?.success || !completeData?.attachment?.id) {
+                throw new Error("OSS回填失败");
+            }
+            applyUploadSuccess(item, completeData.attachment.id);
+        }
+
+        function uploadAttachmentItem(item, conversationId) {
             item.status = "uploading";
             item.progress = 0;
-            item.xhr = xhr;
+            item.errorMessage = "";
             renderAttachmentList();
 
-            xhr.upload.onprogress = (event) => {
-                if (event.lengthComputable) {
-                    const percent = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
-                    item.progress = percent;
-                    renderAttachmentList();
+            (async () => {
+                try {
+                    await uploadAttachmentViaOss(item, conversationId);
+                } catch (error) {
+                    const canFallback = String(error?.errorCode || "") === "OSS_NOT_CONFIGURED"
+                        || /OSS未配置|直传|presign/i.test(String(error?.message || ""));
+                    if (canFallback) {
+                        try {
+                            await uploadAttachmentViaBackend(item, conversationId);
+                            return;
+                        } catch (fallbackError) {
+                            setUploadFailed(item, fallbackError?.message || "upload failed");
+                            return;
+                        }
+                    }
+                    setUploadFailed(item, error?.message || "upload failed");
                 }
-            };
-            xhr.onload = () => {
-                item.xhr = null;
-                const data = (xhr.response && typeof xhr.response === "object")
-                    ? xhr.response
-                    : safeJSONParse(xhr.responseText || "{}", {});
-                if (xhr.status === 200 && data?.success && data?.attachment?.id) {
-                    item.status = "success";
-                    item.progress = 100;
-                    item.uploadId = String(data.attachment.id);
-                    item.errorMessage = "";
-                    item.file = null;
-                    renderAttachmentList();
-                    return;
-                }
-                if (xhr.status === 401) {
-                    setAuthRequiredState();
-                }
-                item.status = "error";
-                item.errorMessage = String(data?.message || xhr.statusText || "upload failed");
-                renderAttachmentList();
-            };
-            xhr.onerror = () => {
-                item.xhr = null;
-                item.status = "error";
-                item.errorMessage = "network error";
-                renderAttachmentList();
-            };
-            xhr.ontimeout = () => {
-                item.xhr = null;
-                item.status = "error";
-                item.errorMessage = "timeout";
-                renderAttachmentList();
-            };
-            xhr.onabort = () => {
-                item.xhr = null;
-            };
-            xhr.send(formData);
+            })();
         }
 
         function addAttachments(files) {
@@ -1657,6 +1889,10 @@
 
         elements.openSettings.addEventListener("click", () => elements.modalOverlay.classList.add("active"));
         elements.closeSettings.addEventListener("click", () => elements.modalOverlay.classList.remove("active"));
+        elements.sidebarToggle.addEventListener("click", () => {
+            const next = writeSidebarCollapsed(!readSidebarCollapsed());
+            applySidebarCollapsed(next);
+        });
         elements.modalOverlay.addEventListener("click", (event) => {
             if (event.target === elements.modalOverlay) {
                 elements.modalOverlay.classList.remove("active");
@@ -1732,6 +1968,7 @@
 
         elements.loginForm.addEventListener("submit", handleLoginSubmit);
 
+        applySidebarCollapsed(readSidebarCollapsed());
         renderAttachmentList();
         tryRestoreSession();
     </script>

@@ -10,6 +10,7 @@ const mammoth = require("mammoth");
 const XLSX = require("xlsx");
 const WordExtractor = require("word-extractor");
 const pdfParse = require("pdf-parse");
+const { once } = require("events");
 const { GoogleGenAI } = require("@google/genai");
 
 const app = express();
@@ -30,11 +31,89 @@ function readNonNegativeInt(name, fallback) {
   return fallback;
 }
 
+function readBool(name, fallback) {
+  const raw = String(process.env[name] || "").trim().toLowerCase();
+  if (!raw) return fallback;
+  if (["1", "true", "yes", "y", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "n", "off"].includes(raw)) return false;
+  return fallback;
+}
+
 function parseCorsOrigins(rawOrigins) {
   return String(rawOrigins)
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean);
+}
+
+function normalizeHost(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/+$/g, "");
+}
+
+function hasOssCredentials() {
+  return Boolean(OSS_ENABLED && OSS_BUCKET && OSS_ENDPOINT && OSS_ACCESS_KEY_ID && OSS_ACCESS_KEY_SECRET);
+}
+
+function getOssHost() {
+  const endpointHost = normalizeHost(OSS_ENDPOINT);
+  if (!endpointHost) return "";
+  if (endpointHost.startsWith(`${OSS_BUCKET}.`)) return endpointHost;
+  return `${OSS_BUCKET}.${endpointHost}`;
+}
+
+function getOssUploadBaseUrl() {
+  const host = getOssHost();
+  if (!host) return "";
+  return `${OSS_FORCE_HTTPS ? "https" : "http"}://${host}`;
+}
+
+function encodeOssObjectKey(key) {
+  return String(key || "")
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+function sanitizeObjectName(name) {
+  return String(name || "file")
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120) || "file";
+}
+
+function buildOssObjectKey({ userId, conversationId, fileName }) {
+  const safeUserId = sanitizeObjectName(userId || "unknown");
+  const safeConversationId = sanitizeObjectName(conversationId || "default");
+  const safeFileName = sanitizeObjectName(fileName || "file");
+  const randomHex = crypto.randomBytes(6).toString("hex");
+  return `${OSS_OBJECT_PREFIX}/${safeUserId}/${safeConversationId}/${Date.now()}_${randomHex}_${safeFileName}`;
+}
+
+function signOssPolicyBase64(policyBase64) {
+  return crypto.createHmac("sha1", OSS_ACCESS_KEY_SECRET).update(policyBase64).digest("base64");
+}
+
+function buildSignedOssGetUrl(objectKey, expireSeconds = 300) {
+  const host = getOssHost();
+  if (!host) return "";
+  const expires = Math.floor(Date.now() / 1000) + Math.max(60, expireSeconds);
+  const canonicalResource = `/${OSS_BUCKET}/${String(objectKey || "").replace(/^\/+/, "")}`;
+  const stringToSign = `GET\n\n\n${expires}\n${canonicalResource}`;
+  const signature = crypto
+    .createHmac("sha1", OSS_ACCESS_KEY_SECRET)
+    .update(stringToSign)
+    .digest("base64");
+  const base = `${OSS_FORCE_HTTPS ? "https" : "http"}://${host}/${encodeOssObjectKey(objectKey)}`;
+  const query = new URLSearchParams({
+    OSSAccessKeyId: OSS_ACCESS_KEY_ID,
+    Expires: String(expires),
+    Signature: signature,
+  });
+  return `${base}?${query.toString()}`;
 }
 
 function parseModelList(raw, fallback) {
@@ -115,6 +194,16 @@ const CONTEXT_MAX_MESSAGES = readNonNegativeInt("CONTEXT_MAX_MESSAGES", 0);
 const CONTEXT_TTL_MS = readPositiveInt("CONTEXT_TTL_MS", 30 * 24 * 60 * 60 * 1000);
 const UPLOAD_ATTACHMENT_TTL_MS = readPositiveInt("UPLOAD_ATTACHMENT_TTL_MS", 24 * 60 * 60 * 1000);
 const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000);
+const OSS_ENABLED = readBool("OSS_ENABLED", true);
+const OSS_BUCKET = String(process.env.OSS_BUCKET || "").trim();
+const OSS_ENDPOINT = String(process.env.OSS_ENDPOINT || "").trim();
+const OSS_ACCESS_KEY_ID = String(process.env.OSS_ACCESS_KEY_ID || "").trim();
+const OSS_ACCESS_KEY_SECRET = String(process.env.OSS_ACCESS_KEY_SECRET || "").trim();
+const OSS_OBJECT_PREFIX = String(process.env.OSS_OBJECT_PREFIX || "uploads").trim() || "uploads";
+const OSS_PRESIGN_EXPIRE_SECONDS = readPositiveInt("OSS_PRESIGN_EXPIRE_SECONDS", 600);
+const OSS_FETCH_TIMEOUT_MS = readPositiveInt("OSS_FETCH_TIMEOUT_MS", 180_000);
+const OSS_FORCE_HTTPS = readBool("OSS_FORCE_HTTPS", true);
+const OSS_PUBLIC_BASE_URL = String(process.env.OSS_PUBLIC_BASE_URL || "").trim();
 
 const DEFAULT_ALLOWED_MODELS = [
   "gemini-3.1-pro-preview",
@@ -427,6 +516,60 @@ async function readUtf8TextLimited(filePath, maxChars) {
   return output.slice(0, maxChars);
 }
 
+async function downloadRemoteFileToTemp({ fileUrl, expectedSize, fileName }) {
+  const safeName = sanitizeObjectName(fileName || "file");
+  const ext = path.extname(safeName).slice(0, 16);
+  const tempPath = path.join(
+    UPLOAD_TMP_DIR,
+    `remote_${Date.now()}_${crypto.randomBytes(8).toString("hex")}${ext}`
+  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), OSS_FETCH_TIMEOUT_MS);
+
+  let output;
+  try {
+    const response = await fetch(fileUrl, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) {
+      throw new Error(`远程文件拉取失败：HTTP ${response.status}`);
+    }
+
+    output = fs.createWriteStream(tempPath);
+    const reader = response.body.getReader();
+    let total = 0;
+    const maxBytes = Math.max(MAX_BINARY_ATTACHMENT_BYTES, Number(expectedSize) || 0);
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw new Error(`远程附件超过限制（>${Math.floor(maxBytes / 1024 / 1024)}MB）`);
+      }
+      if (!output.write(Buffer.from(value))) {
+        await once(output, "drain");
+      }
+    }
+    output.end();
+    await once(output, "finish");
+    return {
+      path: tempPath,
+      size: total,
+    };
+  } catch (error) {
+    if (output && !output.destroyed) {
+      output.destroy();
+    }
+    await safeUnlink(tempPath);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function parseWordToText(filePath, mimeType) {
   if (mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
     const result = await mammoth.extractRawText({ path: filePath });
@@ -730,6 +873,147 @@ async function handleUploadAttachment(req, res) {
   }
 }
 
+function buildOssPostPolicy({ objectKey }) {
+  const expiresAt = new Date(Date.now() + OSS_PRESIGN_EXPIRE_SECONDS * 1000).toISOString();
+  const policyObject = {
+    expiration: expiresAt,
+    conditions: [
+      ["content-length-range", 1, MAX_BINARY_ATTACHMENT_BYTES],
+      { bucket: OSS_BUCKET },
+      { key: objectKey },
+    ],
+  };
+  const policyBase64 = Buffer.from(JSON.stringify(policyObject)).toString("base64");
+  const signature = signOssPolicyBase64(policyBase64);
+  return {
+    expiresAt,
+    fields: {
+      key: objectKey,
+      policy: policyBase64,
+      OSSAccessKeyId: OSS_ACCESS_KEY_ID,
+      Signature: signature,
+      success_action_status: "200",
+    },
+  };
+}
+
+function getPublicObjectUrl(objectKey) {
+  const preferredBase = String(OSS_PUBLIC_BASE_URL || "").trim().replace(/\/+$/g, "");
+  const uploadBase = getOssUploadBaseUrl().replace(/\/+$/g, "");
+  const base = preferredBase || uploadBase;
+  if (!base) return "";
+  return `${base}/${encodeOssObjectKey(objectKey)}`;
+}
+
+async function handleUploadPresign(req, res) {
+  if (!hasOssCredentials()) {
+    return res.status(400).json({
+      success: false,
+      errorCode: "OSS_NOT_CONFIGURED",
+      message: "OSS 未配置，暂无法启用直传上传",
+    });
+  }
+  const conversationId = normalizeConversationId(req.body?.conversationId);
+  const fileName = normalizeFilename(req.body?.fileName || req.body?.name, "附件");
+  const fileSize = Number(req.body?.size) || 0;
+  if (fileSize <= 0 || fileSize > MAX_BINARY_ATTACHMENT_BYTES) {
+    return res.status(400).json({
+      success: false,
+      message: `附件大小无效，单个文件最大 ${Math.floor(MAX_BINARY_ATTACHMENT_BYTES / 1024 / 1024)}MB`,
+    });
+  }
+
+  const objectKey = buildOssObjectKey({
+    userId: req.authUser.id,
+    conversationId,
+    fileName,
+  });
+  const policy = buildOssPostPolicy({ objectKey });
+  const uploadUrl = getOssUploadBaseUrl();
+  return res.json({
+    success: true,
+    mode: "oss-direct",
+    uploadUrl,
+    method: "POST",
+    fields: policy.fields,
+    objectKey,
+    objectUrl: getPublicObjectUrl(objectKey),
+    expiresAt: policy.expiresAt,
+    maxFileSize: MAX_BINARY_ATTACHMENT_BYTES,
+  });
+}
+
+async function handleUploadComplete(req, res) {
+  if (!hasOssCredentials()) {
+    return res.status(400).json({
+      success: false,
+      errorCode: "OSS_NOT_CONFIGURED",
+      message: "OSS 未配置，暂无法完成直传回调",
+    });
+  }
+
+  const conversationId = normalizeConversationId(req.body?.conversationId);
+  const objectKey = String(req.body?.objectKey || "").trim().replace(/^\/+/, "");
+  const fileName = normalizeFilename(req.body?.fileName || req.body?.name, path.basename(objectKey) || "附件");
+  const mimeType = normalizeUploadMimeType(req.body?.mimeType, fileName);
+  const expectedSize = Number(req.body?.size) || 0;
+
+  if (!objectKey) {
+    return res.status(400).json({
+      success: false,
+      message: "objectKey 不能为空",
+    });
+  }
+
+  const ownerPrefix = `${OSS_OBJECT_PREFIX}/${sanitizeObjectName(req.authUser.id)}/${sanitizeObjectName(conversationId)}/`;
+  if (!objectKey.startsWith(ownerPrefix)) {
+    return res.status(403).json({
+      success: false,
+      message: "无权访问该对象",
+    });
+  }
+
+  try {
+    const signedUrl = buildSignedOssGetUrl(objectKey, 300);
+    const downloaded = await downloadRemoteFileToTemp({
+      fileUrl: signedUrl,
+      expectedSize,
+      fileName,
+    });
+
+    const record = await createUploadedAttachmentRecord({
+      file: {
+        originalname: fileName,
+        mimetype: mimeType,
+        size: downloaded.size,
+        path: downloaded.path,
+      },
+      userId: req.authUser.id,
+      conversationId,
+    });
+    uploadedAttachments.set(record.id, record);
+
+    return res.json({
+      success: true,
+      attachment: {
+        id: record.id,
+        name: record.name,
+        mimeType: record.mimeType,
+        size: record.size,
+        kind: record.kind,
+        conversationId: record.conversationId,
+        source: "oss",
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: "直传文件回填失败",
+      error: normalizeErrorMessage(error),
+    });
+  }
+}
+
 setInterval(() => {
   const now = Date.now();
 
@@ -853,6 +1137,8 @@ app.get("/api/models", requireAuth, (_req, res) => {
   });
 });
 
+app.post("/api/uploads/presign", requireAuth, handleUploadPresign);
+app.post("/api/uploads/complete", requireAuth, handleUploadComplete);
 app.post("/api/uploads", requireAuth, uploadSingleFileMiddleware, handleUploadAttachment);
 
 app.post("/api/uploads/delete", requireAuth, async (req, res) => {
@@ -1721,6 +2007,7 @@ app.listen(PORT, () => {
   console.log(`👉 上下文记忆条数：${CONTEXT_MAX_MESSAGES > 0 ? CONTEXT_MAX_MESSAGES : "不限制"}`);
   console.log(`👉 上下文保留时长：${Math.round(CONTEXT_TTL_MS / 1000 / 60)} 分钟`);
   console.log(`👉 附件上传：最多 ${MAX_ATTACHMENTS} 个/轮，单个 ${Math.floor(MAX_BINARY_ATTACHMENT_BYTES / 1024 / 1024)}MB`);
+  console.log(`👉 上传架构：${hasOssCredentials() ? "OSS直传 + 后端回填分析" : "本地直传后端（OSS未配置）"}`);
   console.log(`👉 上传保留时长：${Math.round(UPLOAD_ATTACHMENT_TTL_MS / 1000 / 60)} 分钟`);
   console.log(`👉 运行环境：${NODE_ENV}`);
   console.log(`👉 接口限流：${RATE_LIMIT_MAX_REQUESTS}次/${Math.round(RATE_LIMIT_WINDOW_MS / 1000)}秒`);
