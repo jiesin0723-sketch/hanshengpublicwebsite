@@ -89,9 +89,12 @@
 
         .history-title { font-size: 12px; color: var(--text-light); margin-bottom: 16px; padding-left: 8px; letter-spacing: 1px; }
         .history-list { list-style: none; padding: 0; margin: 0; overflow-y: auto; flex: 1; }
-        .history-item { padding: 12px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; color: rgba(255, 255, 255, 0.6); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: all 0.2s; margin-bottom: 4px; }
+        .history-item { display: flex; align-items: center; gap: 8px; padding: 12px 10px 12px 16px; border-radius: 8px; cursor: pointer; font-size: 14px; color: rgba(255, 255, 255, 0.6); transition: all 0.2s; margin-bottom: 4px; }
         .history-item:hover { background-color: var(--hover-bg); color: var(--text-white); }
         .history-item.active { background-color: rgba(140, 232, 255, 0.14); color: var(--text-cyan); border: 1px solid rgba(140, 232, 255, 0.28); }
+        .history-item-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .history-delete-btn { border: none; background: transparent; color: rgba(255, 255, 255, 0.35); border-radius: 6px; width: 24px; height: 24px; font-size: 16px; line-height: 1; cursor: pointer; flex-shrink: 0; }
+        .history-delete-btn:hover { color: #ffd7d7; background: rgba(220, 38, 38, 0.18); }
         .history-empty { padding: 12px 16px; font-size: 13px; color: rgba(255,255,255,0.35); }
 
         /* --- 右侧主内容区 --- */
@@ -196,6 +199,7 @@
         footer { padding: 0 40px 40px; display: flex; justify-content: center; }
         .footer-inner { width: 100%; max-width: 800px; display: flex; flex-direction: column; gap: 10px; }
         .attachment-list { display: flex; flex-wrap: wrap; gap: 8px; min-height: 0; }
+        .attachment-summary { font-size: 12px; color: rgba(215, 246, 255, 0.82); min-height: 16px; }
         .thinking-status { border: 1px solid rgba(140, 232, 255, 0.28); background: rgba(140, 232, 255, 0.08); border-radius: 10px; padding: 8px 10px; }
         .thinking-status[hidden] { display: none; }
         .thinking-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; font-size: 12px; color: #d7f6ff; }
@@ -203,6 +207,10 @@
         .thinking-bar { height: 100%; width: 0; border-radius: 999px; background: linear-gradient(90deg, #24b9ff, #95f2ff); transition: width 0.25s linear; }
         .attachment-chip { display: inline-flex; align-items: center; gap: 8px; border: 1px solid rgba(140, 232, 255, 0.28); background: rgba(140, 232, 255, 0.08); color: #d7f6ff; padding: 6px 10px; border-radius: 999px; font-size: 12px; max-width: 100%; }
         .attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+        .attachment-status { font-size: 11px; color: rgba(215, 246, 255, 0.86); }
+        .attachment-status.uploading { color: #8ce8ff; }
+        .attachment-status.success { color: #97f5bc; }
+        .attachment-status.error { color: #ffb3b3; }
         .attachment-remove { border: none; background: transparent; color: rgba(215, 246, 255, 0.9); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
         .attachment-remove:hover { color: #ffffff; }
         .attach-btn.active { color: var(--text-cyan); box-shadow: 0 0 12px rgba(140, 232, 255, 0.25) inset; }
@@ -340,6 +348,7 @@
             <footer>
                 <div class="footer-inner">
                     <div class="attachment-list" id="attachment-list"></div>
+                    <div class="attachment-summary" id="attachment-summary"></div>
                     <div class="thinking-status" id="thinking-status" hidden>
                         <div class="thinking-meta">
                             <span id="thinking-text">正在思考中...</span>
@@ -480,9 +489,8 @@
             max: 240_000
         };
         const DEFAULT_THINKING_MODE = "standard";
-        const MAX_ATTACHMENTS = 4;
-        const MAX_FILE_SIZE_BYTES = 6 * 1024 * 1024;
-        const MAX_TEXT_ATTACHMENT_CHARS = 120000;
+        const MAX_ATTACHMENTS = 15;
+        const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
         const TEXT_MIME_TYPES = new Set(["text/plain", "text/markdown", "text/csv", "application/json"]);
         const BINARY_MIME_TYPES = new Set([
             "application/pdf",
@@ -525,7 +533,14 @@
                 loginFailed: "账号或密码错误，请重新输入。",
                 noBackend: "无法连接后端服务，请确认后端已启动。",
                 thinkingStatus: "正在深度思考与检索...",
-                thinkingEta: "预计剩余 {s} 秒"
+                thinkingEta: "预计剩余 {s} 秒",
+                deleteConversationConfirm: "确定删除该历史对话吗？该操作不可恢复。",
+                deleteConversationTitle: "删除会话",
+                uploadInProgress: "仍有附件上传中，请等待上传完成后再发送。",
+                uploadSummary: "本轮附件：已上传 {ok}/{total}，上限 {max}",
+                uploadFailed: "上传失败",
+                uploadSuccess: "上传成功",
+                uploading: "上传中 {p}%"
             },
             en: {
                 newChat: "New Smart Case",
@@ -548,7 +563,14 @@
                 loginFailed: "Invalid account or password.",
                 noBackend: "Cannot connect to backend service.",
                 thinkingStatus: "Analyzing and searching legal sources...",
-                thinkingEta: "Estimated remaining {s}s"
+                thinkingEta: "Estimated remaining {s}s",
+                deleteConversationConfirm: "Delete this conversation history? This action cannot be undone.",
+                deleteConversationTitle: "Delete Conversation",
+                uploadInProgress: "Some files are still uploading. Please wait before sending.",
+                uploadSummary: "Attachments this turn: uploaded {ok}/{total}, limit {max}",
+                uploadFailed: "Upload failed",
+                uploadSuccess: "Uploaded",
+                uploading: "Uploading {p}%"
             }
         };
 
@@ -590,6 +612,7 @@
             attachBtn: document.getElementById("attach-btn"),
             attachmentInput: document.getElementById("attachment-input"),
             attachmentList: document.getElementById("attachment-list"),
+            attachmentSummary: document.getElementById("attachment-summary"),
             thinkingStatus: document.getElementById("thinking-status"),
             thinkingText: document.getElementById("thinking-text"),
             thinkingEta: document.getElementById("thinking-eta"),
@@ -881,6 +904,35 @@
             return conversation;
         }
 
+        async function deleteConversationContextOnServer(conversationId) {
+            if (!currentUser) return;
+            try {
+                await requestBackend("/api/conversations/delete", {
+                    method: "POST",
+                    requireAuth: true,
+                    body: { conversationId }
+                });
+            } catch (error) {
+                console.warn("删除后端会话上下文失败", error);
+            }
+        }
+
+        function deleteConversationById(conversationId) {
+            const userState = getUserChatState();
+            const index = userState.conversations.findIndex((item) => item.id === conversationId);
+            if (index < 0) return;
+
+            userState.conversations.splice(index, 1);
+            if (userState.activeConversationId === conversationId) {
+                userState.activeConversationId = userState.conversations[0]?.id || "";
+            }
+            saveChatState();
+            clearPendingAttachments({ deleteRemote: true });
+            renderHistoryList();
+            renderConversationMessages();
+            deleteConversationContextOnServer(conversationId);
+        }
+
         function addMessageToConversation(conversationId, role, content) {
             const userState = getUserChatState();
             const conversation = userState.conversations.find((item) => item.id === conversationId);
@@ -976,14 +1028,30 @@
                 if (conversation.id === userState.activeConversationId) {
                     li.classList.add("active");
                 }
-                li.textContent = conversation.title || (currentLang === "zh" ? "未命名会话" : "Untitled");
+                const title = document.createElement("span");
+                title.className = "history-item-title";
+                title.textContent = conversation.title || (currentLang === "zh" ? "未命名会话" : "Untitled");
+
+                const deleteBtn = document.createElement("button");
+                deleteBtn.className = "history-delete-btn";
+                deleteBtn.type = "button";
+                deleteBtn.title = i18n[currentLang].deleteConversationTitle;
+                deleteBtn.textContent = "×";
+                deleteBtn.addEventListener("click", (event) => {
+                    event.stopPropagation();
+                    const confirmed = window.confirm(i18n[currentLang].deleteConversationConfirm);
+                    if (!confirmed) return;
+                    deleteConversationById(conversation.id);
+                });
+
                 li.addEventListener("click", () => {
                     setActiveConversation(conversation.id);
-                    pendingAttachments = [];
-                    renderAttachmentList();
+                    clearPendingAttachments({ deleteRemote: true });
                     renderHistoryList();
                     renderConversationMessages();
                 });
+                li.appendChild(title);
+                li.appendChild(deleteBtn);
                 elements.historyList.appendChild(li);
             });
         }
@@ -1020,11 +1088,15 @@
 
             renderHistoryList();
             renderConversationMessages();
+            renderAttachmentList();
         }
 
         function formatSize(bytes) {
-            if (!Number.isFinite(bytes) || bytes <= 0) return "0KB";
-            return `${(bytes / 1024).toFixed(1)}KB`;
+            if (!Number.isFinite(bytes) || bytes <= 0) return "0B";
+            if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}GB`;
+            if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+            if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+            return `${Math.floor(bytes)}B`;
         }
 
         function attachmentKey(file) {
@@ -1059,35 +1131,196 @@
             return BINARY_MIME_TYPES.has(mimeType);
         }
 
+        function getPrimaryApiUrl(apiPath) {
+            const urls = buildBackendApiUrls(apiPath);
+            return urls[0] || apiPath;
+        }
+
+        function buildPendingAttachment(file) {
+            return {
+                localId: `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                sourceKey: attachmentKey(file),
+                file,
+                name: file.name,
+                size: file.size,
+                mimeType: inferMimeType(file),
+                progress: 0,
+                status: "queued",
+                uploadId: "",
+                errorMessage: "",
+                xhr: null
+            };
+        }
+
+        function getAttachmentStatusText(item) {
+            if (item.status === "uploading") {
+                return i18n[currentLang].uploading.replace("{p}", String(item.progress || 0));
+            }
+            if (item.status === "success") {
+                return i18n[currentLang].uploadSuccess;
+            }
+            if (item.status === "error") {
+                return `${i18n[currentLang].uploadFailed}${item.errorMessage ? `: ${item.errorMessage}` : ""}`;
+            }
+            return "";
+        }
+
+        function renderAttachmentSummary() {
+            const total = pendingAttachments.length;
+            const ok = pendingAttachments.filter((item) => item.status === "success").length;
+            if (total === 0) {
+                elements.attachmentSummary.textContent = "";
+                return;
+            }
+            elements.attachmentSummary.textContent = i18n[currentLang].uploadSummary
+                .replace("{ok}", String(ok))
+                .replace("{total}", String(total))
+                .replace("{max}", String(MAX_ATTACHMENTS));
+        }
+
         function renderAttachmentList() {
             elements.attachmentList.innerHTML = "";
-            pendingAttachments.forEach((file, index) => {
+            pendingAttachments.forEach((item, index) => {
                 const chip = document.createElement("div");
                 chip.className = "attachment-chip";
 
                 const name = document.createElement("span");
                 name.className = "attachment-name";
-                name.textContent = `${file.name} (${formatSize(file.size)})`;
+                name.textContent = `${item.name} (${formatSize(item.size)})`;
+
+                const status = document.createElement("span");
+                status.className = `attachment-status ${item.status}`;
+                status.textContent = getAttachmentStatusText(item);
 
                 const removeBtn = document.createElement("button");
                 removeBtn.className = "attachment-remove";
                 removeBtn.type = "button";
                 removeBtn.textContent = "x";
                 removeBtn.addEventListener("click", () => {
-                    pendingAttachments = pendingAttachments.filter((_, idx) => idx !== index);
-                    renderAttachmentList();
+                    removePendingAttachmentAt(index);
                 });
 
                 chip.appendChild(name);
+                chip.appendChild(status);
                 chip.appendChild(removeBtn);
                 elements.attachmentList.appendChild(chip);
             });
             elements.attachBtn.classList.toggle("active", pendingAttachments.length > 0);
+            renderAttachmentSummary();
+        }
+
+        async function deleteUploadedAttachmentOnServer(uploadId) {
+            if (!uploadId) return;
+            try {
+                await requestBackend("/api/uploads/delete", {
+                    method: "POST",
+                    requireAuth: true,
+                    body: { uploadId }
+                });
+            } catch (error) {
+                console.warn("删除已上传附件失败", error);
+            }
+        }
+
+        function removePendingAttachmentAt(index, options = { deleteRemote: true }) {
+            const item = pendingAttachments[index];
+            if (!item) return;
+            if (item.xhr) {
+                try { item.xhr.abort(); } catch {}
+            }
+            pendingAttachments.splice(index, 1);
+            renderAttachmentList();
+            if (options.deleteRemote && item.status === "success" && item.uploadId) {
+                deleteUploadedAttachmentOnServer(item.uploadId);
+            }
+        }
+
+        function clearPendingAttachments(options = { deleteRemote: true }) {
+            const snapshot = [...pendingAttachments];
+            pendingAttachments = [];
+            renderAttachmentList();
+            snapshot.forEach((item) => {
+                if (item?.xhr) {
+                    try { item.xhr.abort(); } catch {}
+                }
+                if (options.deleteRemote && item?.status === "success" && item.uploadId) {
+                    deleteUploadedAttachmentOnServer(item.uploadId);
+                }
+            });
+        }
+
+        function uploadAttachmentItem(item, conversationId) {
+            const endpoint = getPrimaryApiUrl("/api/uploads");
+            const formData = new FormData();
+            formData.append("conversationId", conversationId);
+            formData.append("file", item.file, item.name);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", endpoint, true);
+            if (authToken) {
+                xhr.setRequestHeader("Authorization", `Bearer ${authToken}`);
+            }
+            xhr.responseType = "json";
+            xhr.timeout = 10 * 60 * 1000;
+            item.status = "uploading";
+            item.progress = 0;
+            item.xhr = xhr;
+            renderAttachmentList();
+
+            xhr.upload.onprogress = (event) => {
+                if (event.lengthComputable) {
+                    const percent = Math.max(1, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+                    item.progress = percent;
+                    renderAttachmentList();
+                }
+            };
+            xhr.onload = () => {
+                item.xhr = null;
+                const data = (xhr.response && typeof xhr.response === "object")
+                    ? xhr.response
+                    : safeJSONParse(xhr.responseText || "{}", {});
+                if (xhr.status === 200 && data?.success && data?.attachment?.id) {
+                    item.status = "success";
+                    item.progress = 100;
+                    item.uploadId = String(data.attachment.id);
+                    item.errorMessage = "";
+                    item.file = null;
+                    renderAttachmentList();
+                    return;
+                }
+                if (xhr.status === 401) {
+                    setAuthRequiredState();
+                }
+                item.status = "error";
+                item.errorMessage = String(data?.message || xhr.statusText || "upload failed");
+                renderAttachmentList();
+            };
+            xhr.onerror = () => {
+                item.xhr = null;
+                item.status = "error";
+                item.errorMessage = "network error";
+                renderAttachmentList();
+            };
+            xhr.ontimeout = () => {
+                item.xhr = null;
+                item.status = "error";
+                item.errorMessage = "timeout";
+                renderAttachmentList();
+            };
+            xhr.onabort = () => {
+                item.xhr = null;
+            };
+            xhr.send(formData);
         }
 
         function addAttachments(files) {
+            if (!currentUser) {
+                setAuthRequiredState();
+                return;
+            }
             const errors = [];
-            const knownKeys = new Set(pendingAttachments.map(attachmentKey));
+            const knownKeys = new Set(pendingAttachments.map((item) => item.sourceKey));
+            const conversationId = ensureActiveConversation().id;
 
             for (const file of files) {
                 if (pendingAttachments.length >= MAX_ATTACHMENTS) {
@@ -1098,7 +1331,7 @@
                     continue;
                 }
                 if (file.size > MAX_FILE_SIZE_BYTES) {
-                    errors.push(`${file.name} 超过 6MB 限制`);
+                    errors.push(`${file.name} 超过 ${formatSize(MAX_FILE_SIZE_BYTES)} 限制`);
                     continue;
                 }
 
@@ -1108,51 +1341,16 @@
                     continue;
                 }
 
-                pendingAttachments.push(file);
+                const item = buildPendingAttachment(file);
+                pendingAttachments.push(item);
                 knownKeys.add(attachmentKey(file));
+                uploadAttachmentItem(item, conversationId);
             }
 
             if (errors.length) {
                 alert(errors.join("\n"));
             }
             renderAttachmentList();
-        }
-
-        function fileToBase64(file) {
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => {
-                    const result = String(reader.result || "");
-                    const base64 = result.includes(",") ? result.split(",")[1] : result;
-                    if (!base64) {
-                        reject(new Error(`文件 ${file.name} 编码失败`));
-                        return;
-                    }
-                    resolve(base64);
-                };
-                reader.onerror = () => reject(new Error(`文件 ${file.name} 读取失败`));
-                reader.readAsDataURL(file);
-            });
-        }
-
-        async function serializeAttachment(file) {
-            const mimeType = inferMimeType(file) || "application/octet-stream";
-            if (isTextAttachment(mimeType)) {
-                let text = await file.text();
-                if (text.length > MAX_TEXT_ATTACHMENT_CHARS) {
-                    text = text.slice(0, MAX_TEXT_ATTACHMENT_CHARS);
-                }
-                return { name: file.name, mimeType, text };
-            }
-            return {
-                name: file.name,
-                mimeType,
-                data: await fileToBase64(file)
-            };
-        }
-
-        async function buildAttachmentPayload(attachments) {
-            return Promise.all(attachments.map((file) => serializeAttachment(file)));
         }
 
         function buildUserPreview(text, attachments) {
@@ -1216,6 +1414,7 @@
             clearThinkingProgress();
             elements.thinkingStatus.hidden = true;
             elements.thinkingBar.style.width = "0";
+            clearPendingAttachments({ deleteRemote: false });
             clearAuthToken();
             authToken = "";
             currentUser = null;
@@ -1293,7 +1492,9 @@
         }
 
         async function requestChat(text, attachments, conversationId, historyMessages, timeoutMs) {
-            const attachmentPayload = await buildAttachmentPayload(attachments);
+            const attachmentIds = attachments
+                .map((item) => String(item?.uploadId || "").trim())
+                .filter(Boolean);
             const selectedModel = readSelectedModel();
             try {
                 const data = await requestBackend("/api/chat", {
@@ -1302,7 +1503,7 @@
                     timeoutMs: Math.max(20_000, Number(timeoutMs) + 20_000),
                     body: {
                         message: text,
-                        attachments: attachmentPayload,
+                        attachmentIds,
                         model: selectedModel,
                         conversationId,
                         webSearch: readWebSearchEnabled(),
@@ -1332,7 +1533,12 @@
                 return;
             }
             const text = elements.inputField.value.trim();
-            const attachmentsSnapshot = [...pendingAttachments];
+            const uploadingCount = pendingAttachments.filter((item) => item.status === "uploading").length;
+            if (uploadingCount > 0) {
+                alert(i18n[currentLang].uploadInProgress);
+                return;
+            }
+            const attachmentsSnapshot = pendingAttachments.filter((item) => item.status === "success" && item.uploadId);
             if (!text && attachmentsSnapshot.length === 0) return;
 
             const activeConversation = ensureActiveConversation();
@@ -1366,8 +1572,7 @@
                 );
                 aiContentNode.textContent = reply;
                 addMessageToConversation(activeConversation.id, "ai", reply);
-                pendingAttachments = [];
-                renderAttachmentList();
+                clearPendingAttachments({ deleteRemote: false });
                 renderHistoryList();
             } catch (error) {
                 const errorMessage = `调用失败：${error.message}`;
@@ -1441,13 +1646,12 @@
         }
 
         async function logout() {
+            clearPendingAttachments({ deleteRemote: true });
             try {
                 await requestBackend("/api/logout", { method: "POST", requireAuth: true });
             } catch (error) {
                 console.warn("退出登录请求失败", error);
             }
-            pendingAttachments = [];
-            renderAttachmentList();
             setAuthRequiredState();
         }
 
@@ -1465,8 +1669,7 @@
                 return;
             }
             createNewConversation();
-            pendingAttachments = [];
-            renderAttachmentList();
+            clearPendingAttachments({ deleteRemote: true });
             renderHistoryList();
             renderConversationMessages();
             elements.inputField.focus();

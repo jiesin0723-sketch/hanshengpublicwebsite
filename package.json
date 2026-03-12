@@ -15,6 +15,11 @@
     "@google/genai": "^1.44.0",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "mammoth": "^1.11.0",
+    "multer": "^2.1.1",
+    "pdf-parse": "^1.1.4",
+    "word-extractor": "^1.0.4",
+    "xlsx": "^0.18.5"
   }
 }

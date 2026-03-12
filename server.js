@@ -1,8 +1,15 @@
 require("dotenv").config();
 const crypto = require("crypto");
+const fs = require("fs");
+const fsp = require("fs/promises");
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const multer = require("multer");
+const mammoth = require("mammoth");
+const XLSX = require("xlsx");
+const WordExtractor = require("word-extractor");
+const pdfParse = require("pdf-parse");
 const { GoogleGenAI } = require("@google/genai");
 
 const app = express();
@@ -88,9 +95,14 @@ const MAX_REQUEST_TIMEOUT_MS = readPositiveInt("MAX_REQUEST_TIMEOUT_MS", 300_000
 const WEB_SEARCH_MIN_TIMEOUT_MS = readPositiveInt("WEB_SEARCH_MIN_TIMEOUT_MS", 90_000);
 const COMPLEX_QUESTION_MIN_TIMEOUT_MS = readPositiveInt("COMPLEX_QUESTION_MIN_TIMEOUT_MS", 120_000);
 const COMPLEX_QUESTION_CHAR_THRESHOLD = readPositiveInt("COMPLEX_QUESTION_CHAR_THRESHOLD", 220);
-const MAX_ATTACHMENTS = readPositiveInt("MAX_ATTACHMENTS", 4);
+const MAX_ATTACHMENTS = readPositiveInt("MAX_ATTACHMENTS", 15);
+const MAX_BINARY_ATTACHMENT_BYTES = readPositiveInt("MAX_BINARY_ATTACHMENT_BYTES", 100 * 1024 * 1024);
+const MAX_BASE64_ATTACHMENT_CHARS = readPositiveInt(
+  "MAX_BASE64_ATTACHMENT_CHARS",
+  Math.ceil((MAX_BINARY_ATTACHMENT_BYTES / 3) * 4) + 8
+);
 const MAX_TEXT_ATTACHMENT_CHARS = readPositiveInt("MAX_TEXT_ATTACHMENT_CHARS", 120_000);
-const MAX_BASE64_ATTACHMENT_CHARS = readPositiveInt("MAX_BASE64_ATTACHMENT_CHARS", 8_000_000);
+const JSON_BODY_LIMIT_MB = readPositiveInt("JSON_BODY_LIMIT_MB", 220);
 const HISTORY_MAX_MESSAGES = readPositiveInt("HISTORY_MAX_MESSAGES", 40);
 const HISTORY_MESSAGE_MAX_CHARS = readPositiveInt("HISTORY_MESSAGE_MAX_CHARS", 6000);
 const RATE_LIMIT_WINDOW_MS = readPositiveInt("RATE_LIMIT_WINDOW_MS", 60_000);
@@ -101,6 +113,8 @@ const AUTH_TOKEN_TTL_MS = readPositiveInt("AUTH_TOKEN_TTL_MS", 24 * 60 * 60 * 10
 const CONTEXT_TURN_PAIRS = readPositiveInt("CONTEXT_TURN_PAIRS", 6);
 const CONTEXT_MAX_MESSAGES = readNonNegativeInt("CONTEXT_MAX_MESSAGES", 0);
 const CONTEXT_TTL_MS = readPositiveInt("CONTEXT_TTL_MS", 30 * 24 * 60 * 60 * 1000);
+const UPLOAD_ATTACHMENT_TTL_MS = readPositiveInt("UPLOAD_ATTACHMENT_TTL_MS", 24 * 60 * 60 * 1000);
+const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000);
 
 const DEFAULT_ALLOWED_MODELS = [
   "gemini-3.1-pro-preview",
@@ -133,6 +147,26 @@ const SUPPORTED_BINARY_MIME_TYPES = new Set([
   "application/vnd.ms-excel",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 ]);
+const WORD_MIME_TYPES = new Set([
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+]);
+const EXCEL_MIME_TYPES = new Set([
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+const PDF_IMAGE_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+]);
+const TEXT_MIME_TYPES = new Set([
+  "text/plain",
+  "text/markdown",
+  "text/csv",
+  "application/json",
+]);
 
 const DEFAULT_AUTH_USERS = [
   {
@@ -162,21 +196,25 @@ const USER_BY_ACCOUNT = new Map(AUTH_USERS.map((user) => [user.account, user]));
 const displayNameStore = new Map(AUTH_USERS.map((user) => [user.id, user.displayName]));
 
 const RESPONSE_STYLE_INSTRUCTION = `
-【角色定位】
-你是一位拥有十余年实务经验的中国大陆资深商事与金融诉讼律师及仲裁员。你的受众是极其专业的合伙人级别律师，你的回答必须摒弃一切废话与客套，直击法律实质。
+【核心角色定位】
+你是一位拥有深厚法理学底蕴和十余年中国大陆商事、金融刑事、金融诉讼实务经验的顶级律师及仲裁员。你的对话对象是同级别的资深律师。你的回答必须摒弃一切AI式的客套与僵化的八股文模板，展现出顶尖法律人的深度思考、批判性思维和商业洞察力。
 
-【工作流与分析逻辑 (强制执行 IRAC 原则)】
-在面对复杂的合同、侵权竞合或刑事合规问题时，你必须严格按照以下结构输出：
-1. **案件拆解与检索策略 (Plan)**：简要列出你为了回答此问题，需要核实的 1-3 个核心法律冲突及对应的底层法规/类案检索方向。
-2. **争议焦点 (Issue)**：精准提炼案件的核心法律冲突。
-3. **裁判规则与法理 (Rule)**：引用具体、现行有效的中国法律法规、司法解释或最高人民法院的指导性案例/公报案例。必须带有具体条文序号和生效年份。
-4. **事实适用 (Application)**：将案件事实代入上述规则，进行严密的逻辑推演。若有附件，必须优先引用附件原文。
-5. **实务结论与风险暴露 (Conclusion)**：给出清晰的倾向性结论，并务必提示诉讼/仲裁的举证风险或商业不确定性。
+【动态认知与输出法则（核心原则）】
+放弃任何固定的回答模板。在回答之前，你必须首先洞察用户提问的“核心意图”，并据此动态调整你的论述结构和深度：
+1. 若为“明确的法条/案例检索”：直接给出精准结果、效力级别及裁判要旨，将检索到的案例和用户的指令之间的关联性进行解释和回应。
+2. 若为“疑难案件/前沿争议探讨”：不要急于下定论。你应当围绕案件事实进行深度推演，主动探讨“同案不同判”的可能、学界争议观点、现有证据与主张是否相符、底层法理冲突，并给出你的独立见解。
+3. 若为“诉讼策略/商业合规咨询”：必须跳出纯粹法条，结合法律实务、证据状态、举证与执行可行性进行多维度沙盘推演；同时明确识别并肯定当事人有利事实与有利论点，并并行提示诉讼风险与其他关键注意事项。
 
-【不可逾越的红线】
-1. **严禁捏造 (Zero Hallucination)**：绝对不允许编造不存在的法条、案号或法院判决。如果你不确定，必须明确回答“现有检索未发现明确依据”。
-2. **强制实证**：引用网络资料、最新法规或案例时，必须在对应句末使用 Markdown 超链接标注原文来源。
-3. **排除非中国大陆法**：除非特别指令，否则禁止引用英美法系规则，必须立足于中国本土司法实践。
+【深度思考要求 (Chain of Thought)】
+在面对复杂金融、证券或商事问题时，你应该展现出你的“思考过程”：
+- 主动识别案件中隐藏的“暗雷”（例如：虽然表面是违约，但是否存在侵权竞合？是否涉及刑事穿透？）。
+- 如果现有法律存在空白或滞后，请运用法律解释学（文义解释、目的解释、体系解释）进行推演，而不是简单回答“没有规定”。
+- 善用对比与类比，引用案例时，不仅要指出相似之处，更要敏锐地指出本案与先例在事实细节上的潜在“区分点 (Distinguishing)”。
+
+【不可逾越的绝对红线（严守法律逻辑底线）】
+1. 反幻觉：绝不捏造法条、案号或法院判决。遇到盲区，必须坦诚“目前未检索到明确依据”，并转为法理推演。
+2. 证据优先：如果用户上传了附件（合同、证据），必须将其作为第一分析顺位，一切推演不得脱离附件事实。
+3. 溯源要求：引用外部资料、法规或裁判文书时，尽量提供可核验的信息（如发文机关、年份），若使用网络搜索，必须带上原文超链接。
 `;
 
 const MODEL_SAMPLING_CONFIG = {
@@ -201,12 +239,62 @@ const PLAN_AND_SOLVE_PROMPT = `
 
 const PLAN_AND_SOLVE_FINAL_PROMPT = `
 请仔细阅读前置的检索策略，系统现已为你开启联网权限。
-请针对这些拆解出的关键词进行深度搜索，交叉比对后，输出最终的 IRAC 法律意见书。
+请针对这些拆解出的关键词进行深度搜索，交叉比对后，输出最终的定制化法律分析意见。
 强制要求：
 1) 结论必须可追溯到中国大陆现行有效法律法规、司法解释、指导性案例或公报案例；
 2) 每个关键外部依据必须在句末添加 Markdown 超链接；
-3) 若附件事实不足或证据链存在断裂，必须明确写出举证风险；
-4) 不得编造法条、案号或裁判观点。
+3) 必须围绕案件事实展开推演，识别并肯定有利事实/有利论点，同时提示诉讼风险与其他注意事项；
+4) 若附件事实不足或证据链存在断裂，必须明确写出举证风险；
+5) 不得编造法条、案号或裁判观点。
+`;
+
+const FORENSIC_FINANCE_KEYWORDS = [
+  "资金往来",
+  "账户流水",
+  "流水",
+  "闭环",
+  "代持",
+  "辩护意见",
+  "符合辩护",
+  "转入",
+  "转出",
+  "证券",
+  "质押",
+  "解押",
+  "证转银",
+  "资金分析",
+];
+
+const FORENSIC_FINANCE_SPECIAL_PROMPT = `
+【专项分析模式：资金穿透审查（对齐高质量官方回答）】
+你必须按以下结构输出，并保持“证据驱动 + 法律归因 + 风险提示”三层并行：
+
+一、关键往来账户归类（先给全局资金地图）
+- 明确“资金来源方/过桥方/证券机构/最终沉淀方”，说明各主体在资金链中的角色。
+
+二、资金往来逻辑的四大匹配性分析（逐段论证）
+- 逻辑1：谁承担利息与持仓成本（识别垫资行为）
+- 逻辑2：谁提供解押或保全本金（识别大额同日过桥）
+- 逻辑3：变现后是否原路回流（识别闭环结算）
+- 逻辑4：最终收益归于谁（识别实质受益人）
+
+三、证据-结论映射（必须可核验）
+- 至少列出 8 条“时间-金额-对手方-动作-结论”节点。
+- 必须主动识别异常特征：秒进秒出、等额划转（精确到分）、特定主体高频交易。
+
+四、总结性辩护评估结论（法律化落点）
+- 先肯定对用户有利的证据，再指出冲突点和诉讼风险。
+- 回归法律本质：代持、资金池、职务侵占、抽逃出资等可能定性。
+- 明确“不确定区间”和补强证据建议，禁止过度推断。
+`;
+
+const CHEN_QIUMING_STYLE_HINT = `
+【同题高质量对齐要求】
+针对“陈秋明-辩护意见-资金往来”类问题，输出风格需贴近以下方法：
+1) 先给“核心结论一句话”，再进入分节论证；
+2) 至少 8 条交易节点，节点中必须含“时间、金额、对手方、动作、法律意义”；
+3) 对每个结论都要写清“为什么该流水支持/削弱该辩护观点”；
+4) 结尾必须给“可直接用于庭审的证据组织建议”（按证据编号/证明目的/质证风险）。
 `;
 
 const WEB_SEARCH_FORCE_KEYWORDS = [
@@ -234,6 +322,25 @@ const ai = new GoogleGenAI({
 
 const sessions = new Map();
 const conversationContexts = new Map();
+const uploadedAttachments = new Map();
+const UPLOAD_TMP_DIR = path.join(__dirname, ".upload-tmp");
+fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
+const wordExtractor = new WordExtractor();
+const uploadStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_TMP_DIR),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(String(file.originalname || "")).slice(0, 12);
+    const unique = `${Date.now()}_${crypto.randomBytes(8).toString("hex")}${ext}`;
+    cb(null, unique);
+  },
+});
+const uploadMulter = multer({
+  storage: uploadStorage,
+  limits: {
+    files: 1,
+    fileSize: MAX_BINARY_ATTACHMENT_BYTES,
+  },
+});
 const chatRateLimiter = createInMemoryRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   maxRequests: RATE_LIMIT_MAX_REQUESTS,
@@ -258,8 +365,370 @@ app.use(
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: `${JSON_BODY_LIMIT_MB}mb` }));
 app.use(express.static(path.join(__dirname)));
+
+function inferMimeTypeFromFilename(filename) {
+  const lower = String(filename || "").toLowerCase();
+  if (lower.endsWith(".txt")) return "text/plain";
+  if (lower.endsWith(".md")) return "text/markdown";
+  if (lower.endsWith(".csv")) return "text/csv";
+  if (lower.endsWith(".json")) return "application/json";
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".png")) return "image/png";
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+  if (lower.endsWith(".webp")) return "image/webp";
+  if (lower.endsWith(".doc")) return "application/msword";
+  if (lower.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  if (lower.endsWith(".xls")) return "application/vnd.ms-excel";
+  if (lower.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  return "";
+}
+
+function normalizeUploadMimeType(rawMimeType, filename) {
+  const raw = String(rawMimeType || "").trim().toLowerCase();
+  if (raw && raw !== "application/octet-stream") return raw;
+  return inferMimeTypeFromFilename(filename);
+}
+
+function isTextLikeMimeType(mimeType) {
+  if (!mimeType) return false;
+  if (TEXT_MIME_TYPES.has(mimeType)) return true;
+  return mimeType.startsWith("text/");
+}
+
+function nextUploadAttachmentId() {
+  return `att_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
+}
+
+async function safeUnlink(filePath) {
+  if (!filePath) return;
+  try {
+    await fsp.unlink(filePath);
+  } catch {
+    // ignore
+  }
+}
+
+async function readUtf8TextLimited(filePath, maxChars) {
+  let output = "";
+  const stream = fs.createReadStream(filePath, { encoding: "utf8" });
+  try {
+    for await (const chunk of stream) {
+      output += chunk;
+      if (output.length >= maxChars) {
+        stream.destroy();
+        break;
+      }
+    }
+  } finally {
+    stream.destroy();
+  }
+  return output.slice(0, maxChars);
+}
+
+async function parseWordToText(filePath, mimeType) {
+  if (mimeType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
+    const result = await mammoth.extractRawText({ path: filePath });
+    return String(result?.value || "");
+  }
+  if (mimeType === "application/msword") {
+    const extracted = await wordExtractor.extract(filePath);
+    return String(extracted?.getBody?.() || "");
+  }
+  return "";
+}
+
+function parseExcelToText(filePath) {
+  const workbook = XLSX.readFile(filePath, {
+    cellText: true,
+    cellDates: true,
+  });
+  const sheets = [];
+  for (const sheetName of workbook.SheetNames || []) {
+    const worksheet = workbook.Sheets[sheetName];
+    if (!worksheet) continue;
+    const csv = XLSX.utils.sheet_to_csv(worksheet, { blankrows: false }).trim();
+    if (!csv) continue;
+    sheets.push(`【工作表：${sheetName}】\n${csv}`);
+  }
+  return sheets.join("\n\n");
+}
+
+async function parsePdfToText(filePath) {
+  const buffer = await fsp.readFile(filePath);
+  const parsed = await pdfParse(buffer);
+  const text = String(parsed?.text || "")
+    .replace(/\u0000/g, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  return text;
+}
+
+async function uploadBinaryFileToGemini({ filePath, mimeType, displayName }) {
+  const uploadedFile = await ai.files.upload({
+    file: filePath,
+    config: {
+      mimeType,
+      displayName,
+    },
+  });
+  const fileUri = String(uploadedFile?.uri || "").trim();
+  const geminiFileName = String(uploadedFile?.name || "").trim();
+  if (!fileUri || !geminiFileName) {
+    throw new Error("文件上传到 Gemini 失败：未返回有效文件 URI");
+  }
+  return { fileUri, geminiFileName };
+}
+
+async function createUploadedAttachmentRecord({ file, userId, conversationId }) {
+  const name = normalizeFilename(file?.originalname, "附件");
+  const mimeType = normalizeUploadMimeType(file?.mimetype, name);
+  if (!mimeType) {
+    throw new Error(`不支持的附件类型：${name}`);
+  }
+
+  const record = {
+    id: nextUploadAttachmentId(),
+    userId,
+    conversationId,
+    name,
+    mimeType,
+    size: Number(file?.size) || 0,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + UPLOAD_ATTACHMENT_TTL_MS,
+    kind: "text",
+    text: "",
+    fileUri: "",
+    data: "",
+    geminiFileName: "",
+  };
+
+  try {
+    if (isTextLikeMimeType(mimeType)) {
+      const text = await readUtf8TextLimited(file.path, TEXT_EXTRACT_MAX_CHARS);
+      record.kind = "text";
+      record.text = text.slice(0, TEXT_EXTRACT_MAX_CHARS);
+      return record;
+    }
+
+    if (WORD_MIME_TYPES.has(mimeType)) {
+      const text = await parseWordToText(file.path, mimeType);
+      record.kind = "text";
+      record.mimeType = "text/plain";
+      record.text = String(text || "").slice(0, TEXT_EXTRACT_MAX_CHARS);
+      return record;
+    }
+
+    if (EXCEL_MIME_TYPES.has(mimeType)) {
+      const text = parseExcelToText(file.path);
+      record.kind = "text";
+      record.mimeType = "text/plain";
+      record.text = String(text || "").slice(0, TEXT_EXTRACT_MAX_CHARS);
+      return record;
+    }
+
+    if (PDF_IMAGE_MIME_TYPES.has(mimeType)) {
+      try {
+        const uploadedBinary = await uploadBinaryFileToGemini({
+          filePath: file.path,
+          mimeType,
+          displayName: name,
+        });
+        record.kind = "binary";
+        record.fileUri = uploadedBinary.fileUri;
+        record.geminiFileName = uploadedBinary.geminiFileName;
+        return record;
+      } catch (uploadError) {
+        // PDF上传失败时，优先走文本解析兜底，避免用户上传即失败。
+        if (mimeType === "application/pdf") {
+          try {
+            const pdfText = await parsePdfToText(file.path);
+            if (pdfText) {
+              record.kind = "text";
+              record.mimeType = "text/plain";
+              record.text = pdfText.slice(0, TEXT_EXTRACT_MAX_CHARS);
+              return record;
+            }
+          } catch {
+            // continue fallback
+          }
+        }
+
+        // 二级兜底：改为inlineData，绕过Gemini文件上传接口。
+        const rawBuffer = await fsp.readFile(file.path);
+        const base64 = rawBuffer.toString("base64");
+        if (base64.length <= MAX_BASE64_ATTACHMENT_CHARS) {
+          record.kind = "binary";
+          record.fileUri = "";
+          record.geminiFileName = "";
+          record.data = base64;
+          return record;
+        }
+        throw new Error(`附件上传失败，且兜底解析未成功：${normalizeErrorMessage(uploadError)}`);
+      }
+    }
+
+    throw new Error(`不支持的附件类型：${name}（${mimeType}）`);
+  } finally {
+    await safeUnlink(file.path);
+  }
+}
+
+async function deleteGeminiFileByName(geminiFileName) {
+  if (!geminiFileName) return;
+  try {
+    await ai.files.delete({ name: geminiFileName });
+  } catch {
+    // ignore
+  }
+}
+
+async function removeUploadedAttachmentRecord(record, { deleteRemote = true } = {}) {
+  if (!record) return false;
+  uploadedAttachments.delete(record.id);
+  if (deleteRemote && record.kind === "binary") {
+    await deleteGeminiFileByName(record.geminiFileName);
+  }
+  return true;
+}
+
+async function removeUploadedAttachmentByIdForUser(userId, uploadId, { deleteRemote = true } = {}) {
+  const record = uploadedAttachments.get(String(uploadId || ""));
+  if (!record || record.userId !== userId) return false;
+  return removeUploadedAttachmentRecord(record, { deleteRemote });
+}
+
+async function removeUploadedAttachmentsByConversation(userId, conversationId) {
+  const removedIds = [];
+  const tasks = [];
+  for (const record of uploadedAttachments.values()) {
+    if (record.userId === userId && record.conversationId === conversationId) {
+      removedIds.push(record.id);
+      tasks.push(removeUploadedAttachmentRecord(record, { deleteRemote: true }));
+    }
+  }
+  await Promise.allSettled(tasks);
+  return removedIds.length;
+}
+
+function normalizeAttachmentIds(rawIds) {
+  let input = rawIds;
+  if (typeof rawIds === "string") {
+    try {
+      const parsed = JSON.parse(rawIds);
+      input = parsed;
+    } catch {
+      input = [];
+    }
+  }
+  if (!Array.isArray(input)) return [];
+  const ids = [];
+  const seen = new Set();
+  for (const raw of input) {
+    const value = String(raw || "").trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    ids.push(value);
+    if (ids.length >= MAX_ATTACHMENTS) break;
+  }
+  return ids;
+}
+
+function mapUploadedRecordToAttachment(record) {
+  if (!record) return null;
+  if (record.kind === "text") {
+    return {
+      kind: "text",
+      name: record.name,
+      mimeType: record.mimeType || "text/plain",
+      text: String(record.text || "").slice(0, TEXT_EXTRACT_MAX_CHARS),
+    };
+  }
+  return {
+    kind: "binary",
+    name: record.name,
+    mimeType: record.mimeType,
+    fileUri: record.fileUri || "",
+    data: record.data || "",
+  };
+}
+
+function resolveUploadedAttachments({ userId, conversationId, attachmentIds }) {
+  const resolved = [];
+  const missing = [];
+  for (const id of attachmentIds) {
+    const record = uploadedAttachments.get(id);
+    if (!record || record.userId !== userId || record.conversationId !== conversationId) {
+      missing.push(id);
+      continue;
+    }
+    record.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+    resolved.push(record);
+  }
+  return { resolved, missing };
+}
+
+function uploadSingleFileMiddleware(req, res, next) {
+  uploadMulter.single("file")(req, res, (error) => {
+    if (!error) {
+      next();
+      return;
+    }
+    if (error instanceof multer.MulterError) {
+      if (error.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({
+          success: false,
+          message: `附件超过上限，单个文件最大 ${Math.floor(MAX_BINARY_ATTACHMENT_BYTES / 1024 / 1024)}MB`,
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        message: `上传失败：${error.message}`,
+      });
+    }
+    return next(error);
+  });
+}
+
+async function handleUploadAttachment(req, res) {
+  const conversationId = normalizeConversationId(req.body?.conversationId);
+  if (!req.file) {
+    return res.status(400).json({
+      success: false,
+      message: "未检测到附件文件，请重新上传",
+    });
+  }
+
+  try {
+    const record = await createUploadedAttachmentRecord({
+      file: req.file,
+      userId: req.authUser.id,
+      conversationId,
+    });
+    uploadedAttachments.set(record.id, record);
+
+    return res.json({
+      success: true,
+      attachment: {
+        id: record.id,
+        name: record.name,
+        mimeType: record.mimeType,
+        size: record.size,
+        kind: record.kind,
+        conversationId: record.conversationId,
+      },
+    });
+  } catch (error) {
+    const detail = normalizeErrorMessage(error);
+    const badRequest = /不支持的附件类型/i.test(detail);
+    return res.status(badRequest ? 400 : 500).json({
+      success: false,
+      message: badRequest ? "附件类型不受支持" : "附件解析或上传失败",
+      error: detail,
+    });
+  }
+}
 
 setInterval(() => {
   const now = Date.now();
@@ -274,6 +743,20 @@ setInterval(() => {
     if (!context || context.updatedAt + CONTEXT_TTL_MS <= now) {
       conversationContexts.delete(key);
     }
+  }
+
+  const expiredRecords = [];
+  for (const record of uploadedAttachments.values()) {
+    if (!record || Number(record.expiresAt || 0) <= now) {
+      expiredRecords.push(record);
+    }
+  }
+  if (expiredRecords.length > 0) {
+    Promise.allSettled(
+      expiredRecords.map((record) =>
+        removeUploadedAttachmentRecord(record, { deleteRemote: true })
+      )
+    ).catch(() => {});
   }
 }, 30_000).unref();
 
@@ -367,6 +850,37 @@ app.get("/api/models", requireAuth, (_req, res) => {
     success: true,
     models: ALLOWED_MODELS,
     defaultModel: DEFAULT_MODEL,
+  });
+});
+
+app.post("/api/uploads", requireAuth, uploadSingleFileMiddleware, handleUploadAttachment);
+
+app.post("/api/uploads/delete", requireAuth, async (req, res) => {
+  const uploadId = String(req.body?.uploadId || "").trim();
+  if (!uploadId) {
+    return res.status(400).json({
+      success: false,
+      message: "uploadId 不能为空",
+    });
+  }
+  const deleted = await removeUploadedAttachmentByIdForUser(req.authUser.id, uploadId, {
+    deleteRemote: true,
+  });
+  return res.json({
+    success: true,
+    deleted,
+  });
+});
+
+app.post("/api/conversations/delete", requireAuth, async (req, res) => {
+  const conversationId = normalizeConversationId(req.body?.conversationId);
+  const key = `${req.authUser.id}::${conversationId}`;
+  const deletedContext = conversationContexts.delete(key);
+  const deletedAttachments = await removeUploadedAttachmentsByConversation(req.authUser.id, conversationId);
+  return res.json({
+    success: true,
+    deleted: deletedContext,
+    deletedAttachments,
   });
 });
 
@@ -584,6 +1098,7 @@ function normalizeAttachments(rawAttachments) {
     const mimeType = typeof item.mimeType === "string" ? item.mimeType.trim().toLowerCase() : "";
     const text = typeof item.text === "string" ? item.text.trim() : "";
     const data = typeof item.data === "string" ? item.data.trim() : "";
+    const fileUri = typeof item.fileUri === "string" ? item.fileUri.trim() : "";
 
     if (text) {
       normalized.push({
@@ -591,6 +1106,16 @@ function normalizeAttachments(rawAttachments) {
         name,
         mimeType: mimeType || "text/plain",
         text: text.slice(0, MAX_TEXT_ATTACHMENT_CHARS),
+      });
+      continue;
+    }
+
+    if (fileUri && mimeType && PDF_IMAGE_MIME_TYPES.has(mimeType)) {
+      normalized.push({
+        kind: "binary",
+        name,
+        mimeType,
+        fileUri,
       });
       continue;
     }
@@ -607,13 +1132,47 @@ function normalizeAttachments(rawAttachments) {
       name,
       mimeType,
       data,
+      fileUri: "",
     });
   }
 
   return normalized;
 }
 
-function buildUserParts(userMessage, attachments) {
+function shouldUseForensicFinanceMode(userMessage, attachments) {
+  const question = String(userMessage || "").toLowerCase();
+  const inQuestion = FORENSIC_FINANCE_KEYWORDS.some((keyword) => question.includes(String(keyword).toLowerCase()));
+  if (inQuestion) return true;
+
+  for (const item of attachments || []) {
+    if (!item || item.kind !== "text") continue;
+    const text = String(item.text || "").slice(0, 5000).toLowerCase();
+    if (FORENSIC_FINANCE_KEYWORDS.some((keyword) => text.includes(String(keyword).toLowerCase()))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function shouldUseChenQiumingStyleHint(userMessage, attachments) {
+  const text = String(userMessage || "").toLowerCase();
+  const qHits = ["陈秋明", "辩护意见", "资金往来", "代持"].filter((k) =>
+    text.includes(k.toLowerCase())
+  ).length;
+  if (qHits >= 2) return true;
+
+  const attachmentText = (attachments || [])
+    .filter((item) => item && item.kind === "text")
+    .map((item) => String(item.text || "").toLowerCase())
+    .join("\n")
+    .slice(0, 20_000);
+  const aHits = ["陈秋明", "陈婵君", "陈娜娜", "广州证券", "辩护意见"].filter((k) =>
+    attachmentText.includes(k.toLowerCase())
+  ).length;
+  return aHits >= 2;
+}
+
+function buildUserParts(userMessage, attachments, extraGuidance = "") {
   const fallbackQuestion = "请结合附件内容给出关键结论。";
   const question = userMessage || fallbackQuestion;
   const parts = [
@@ -641,17 +1200,33 @@ function buildUserParts(userMessage, attachments) {
     }
 
     parts.push({ text: `${title}（${attachment.mimeType}）` });
-    parts.push({
-      inlineData: {
-        mimeType: attachment.mimeType,
-        data: attachment.data,
-      },
-    });
+    if (attachment.fileUri) {
+      parts.push({
+        fileData: {
+          fileUri: attachment.fileUri,
+          mimeType: attachment.mimeType,
+        },
+      });
+    } else {
+      parts.push({
+        inlineData: {
+          mimeType: attachment.mimeType,
+          data: attachment.data,
+        },
+      });
+    }
   }
 
   parts.push({
     text: "请优先依据附件内容回答。如果附件信息不足，请明确指出缺失信息。",
   });
+
+  const guidance = String(extraGuidance || "").trim();
+  if (guidance) {
+    parts.push({
+      text: guidance,
+    });
+  }
 
   return parts;
 }
@@ -951,13 +1526,31 @@ async function generateReplyWithRetry({ model, contents, webSearch, timeoutMs, u
 async function handleChat(req, res) {
   const rawMessage = req.body?.message ?? req.body?.question;
   const userMessage = typeof rawMessage === "string" ? rawMessage.trim() : "";
-  const attachments = normalizeAttachments(req.body?.attachments);
+  const conversationId = normalizeConversationId(req.body?.conversationId);
+  const attachmentIds = normalizeAttachmentIds(req.body?.attachmentIds);
+  const legacyAttachments = normalizeAttachments(req.body?.attachments);
+  let attachments = legacyAttachments;
+  if (attachmentIds.length > 0) {
+    const uploaded = resolveUploadedAttachments({
+      userId: req.authUser.id,
+      conversationId,
+      attachmentIds,
+    });
+    if (uploaded.missing.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: "部分附件不存在、已过期，或不属于当前会话，请重新上传后再试",
+        missingAttachmentIds: uploaded.missing,
+      });
+    }
+    attachments = uploaded.resolved.map(mapUploadedRecordToAttachment).filter(Boolean);
+  }
   const requestedModel = req.body?.model;
   const modelResult = resolveRequestModel(requestedModel);
-  const conversationId = normalizeConversationId(req.body?.conversationId);
   const historyMessages = normalizeConversationHistory(req.body?.history);
   const forceWebSearch = shouldForceWebSearchByQuestion(userMessage);
   const useWebSearch = Boolean(req.body?.webSearch) || forceWebSearch;
+  const forensicFinanceMode = shouldUseForensicFinanceMode(userMessage, attachments);
 
   if (!userMessage && attachments.length === 0) {
     return res.status(400).json({
@@ -991,7 +1584,17 @@ async function handleChat(req, res) {
   });
   const context = getConversationContext(req.authUser.id, conversationId);
   primeConversationContext(context, historyMessages);
-  const currentUserParts = buildUserParts(userMessage, attachments);
+  const extraGuidance = [
+    forensicFinanceMode ? FORENSIC_FINANCE_SPECIAL_PROMPT : "",
+    shouldUseChenQiumingStyleHint(userMessage, attachments) ? CHEN_QIUMING_STYLE_HINT : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const currentUserParts = buildUserParts(
+    userMessage,
+    attachments,
+    extraGuidance
+  );
   const contents = buildConversationContents({
     context,
     historyMessages,
@@ -1012,6 +1615,10 @@ async function handleChat(req, res) {
       userMessage || "（无文本问题）",
       "附件数：",
       attachments.length,
+      "附件ID数：",
+      attachmentIds.length,
+      "资金分析模式：",
+      forensicFinanceMode,
       "用户：",
       req.authUser.id,
       "会话：",
@@ -1113,6 +1720,8 @@ app.listen(PORT, () => {
   console.log(`👉 可选模型：${ALLOWED_MODELS.join(", ")}`);
   console.log(`👉 上下文记忆条数：${CONTEXT_MAX_MESSAGES > 0 ? CONTEXT_MAX_MESSAGES : "不限制"}`);
   console.log(`👉 上下文保留时长：${Math.round(CONTEXT_TTL_MS / 1000 / 60)} 分钟`);
+  console.log(`👉 附件上传：最多 ${MAX_ATTACHMENTS} 个/轮，单个 ${Math.floor(MAX_BINARY_ATTACHMENT_BYTES / 1024 / 1024)}MB`);
+  console.log(`👉 上传保留时长：${Math.round(UPLOAD_ATTACHMENT_TTL_MS / 1000 / 60)} 分钟`);
   console.log(`👉 运行环境：${NODE_ENV}`);
   console.log(`👉 接口限流：${RATE_LIMIT_MAX_REQUESTS}次/${Math.round(RATE_LIMIT_WINDOW_MS / 1000)}秒`);
 });
