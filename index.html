@@ -114,6 +114,32 @@
         .history-item:hover { background-color: var(--hover-bg); color: var(--text-white); }
         .history-item.active { background-color: rgba(140, 232, 255, 0.14); color: var(--text-cyan); border: 1px solid rgba(140, 232, 255, 0.28); }
         .history-item-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .history-status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: rgba(140, 232, 255, 0.1);
+            border: 1px solid rgba(140, 232, 255, 0.2);
+            color: #d9fbff;
+            font-size: 11px;
+            line-height: 1;
+            flex-shrink: 0;
+        }
+        .history-status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: #8ce8ff;
+            box-shadow: 0 0 0 0 rgba(140, 232, 255, 0.7);
+            animation: historyPulse 1.4s ease-out infinite;
+        }
+        @keyframes historyPulse {
+            0% { transform: scale(0.9); box-shadow: 0 0 0 0 rgba(140, 232, 255, 0.65); }
+            70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(140, 232, 255, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(140, 232, 255, 0); }
+        }
         .history-delete-btn { border: none; background: transparent; color: rgba(255, 255, 255, 0.35); border-radius: 6px; width: 24px; height: 24px; font-size: 16px; line-height: 1; cursor: pointer; flex-shrink: 0; }
         .history-delete-btn:hover { color: #ffd7d7; background: rgba(220, 38, 38, 0.18); }
         .history-empty { padding: 12px 16px; font-size: 13px; color: rgba(255,255,255,0.35); }
@@ -568,7 +594,7 @@
                 sessionExpired: "登录状态已过期，请重新登录。",
                 loginFailed: "账号或密码错误，请重新输入。",
                 noBackend: "无法连接后端服务，请确认后端已启动。",
-                thinkingStatus: "正在深度思考与检索...",
+                thinkingStatus: "正在深度思考...",
                 thinkingEta: "预计剩余 {s} 秒",
                 deleteConversationConfirm: "确定删除该历史对话吗？该操作不可恢复。",
                 deleteConversationTitle: "删除会话",
@@ -577,6 +603,9 @@
                 uploadFailed: "上传失败",
                 uploadSuccess: "上传成功",
                 uploading: "上传中 {p}%",
+                replyPending: "正在生成专业法律分析，请稍候...",
+                conversationBusy: "当前对话仍在处理中，请稍候，或切换到其他窗口继续提问。",
+                processingTag: "处理中",
                 copyResponse: "复制本次答案",
                 exportWord: "导出为Word",
                 copySuccess: "已复制本次答案到剪贴板",
@@ -603,7 +632,7 @@
                 sessionExpired: "Session expired. Please login again.",
                 loginFailed: "Invalid account or password.",
                 noBackend: "Cannot connect to backend service.",
-                thinkingStatus: "Analyzing and searching legal sources...",
+                thinkingStatus: "Analyzing deeply...",
                 thinkingEta: "Estimated remaining {s}s",
                 deleteConversationConfirm: "Delete this conversation history? This action cannot be undone.",
                 deleteConversationTitle: "Delete Conversation",
@@ -612,6 +641,9 @@
                 uploadFailed: "Upload failed",
                 uploadSuccess: "Uploaded",
                 uploading: "Uploading {p}%",
+                replyPending: "Generating professional legal analysis...",
+                conversationBusy: "This conversation is still processing. Wait or switch to another conversation.",
+                processingTag: "Processing",
                 copyResponse: "Copy response",
                 exportWord: "Export to Word",
                 copySuccess: "Response copied to clipboard",
@@ -896,6 +928,7 @@
 
         const chatState = loadChatState();
         const profileStore = loadProfileStore();
+        const activeRequests = new Map();
 
         function getUserChatState() {
             if (!currentUser) return createEmptyUserChatState();
@@ -909,7 +942,20 @@
             if (typeof chatState[userId].activeConversationId !== "string") {
                 chatState[userId].activeConversationId = "";
             }
+            chatState[userId].conversations = chatState[userId].conversations
+                .filter((item) => item && typeof item === "object")
+                .map((item) => ({
+                    ...item,
+                    messages: Array.isArray(item.messages) ? item.messages : [],
+                    createdAt: Number(item.createdAt) || Date.now(),
+                    updatedAt: Number(item.updatedAt) || Date.now()
+                }));
             return chatState[userId];
+        }
+
+        function getConversationById(conversationId) {
+            const userState = getUserChatState();
+            return userState.conversations.find((item) => item.id === conversationId) || null;
         }
 
         function getConversationTitleFromText(text) {
@@ -986,6 +1032,7 @@
             const index = userState.conversations.findIndex((item) => item.id === conversationId);
             if (index < 0) return;
 
+            activeRequests.delete(conversationId);
             userState.conversations.splice(index, 1);
             if (userState.activeConversationId === conversationId) {
                 userState.activeConversationId = userState.conversations[0]?.id || "";
@@ -1115,7 +1162,8 @@
             aiMessage.appendChild(actions);
         }
 
-        function appendAiMessage(contentText) {
+        function appendAiMessage(contentText, options = {}) {
+            const { showActions = true } = options;
             const aiMessage = document.createElement("div");
             aiMessage.className = "message ai";
 
@@ -1129,7 +1177,9 @@
 
             aiMessage.appendChild(sender);
             aiMessage.appendChild(content);
-            appendAiActionButtons(aiMessage, content);
+            if (showActions) {
+                appendAiActionButtons(aiMessage, content);
+            }
             elements.chatContainer.appendChild(aiMessage);
             elements.chatBox.scrollTop = elements.chatBox.scrollHeight;
             return content;
@@ -1148,7 +1198,11 @@
                 if (message.role === "user") appendUserMessage(message.content);
                 else appendAiMessage(message.content);
             });
+            if (activeRequests.has(conversation.id)) {
+                appendAiMessage(i18n[currentLang].replyPending, { showActions: false });
+            }
             elements.chatBox.scrollTop = elements.chatBox.scrollHeight;
+            syncThinkingProgress();
         }
 
         function renderHistoryList() {
@@ -1193,6 +1247,20 @@
                     renderConversationMessages();
                 });
                 li.appendChild(title);
+                if (activeRequests.has(conversation.id)) {
+                    const statusBadge = document.createElement("span");
+                    statusBadge.className = "history-status-badge";
+
+                    const statusDot = document.createElement("span");
+                    statusDot.className = "history-status-dot";
+
+                    const statusText = document.createElement("span");
+                    statusText.textContent = i18n[currentLang].processingTag;
+
+                    statusBadge.appendChild(statusDot);
+                    statusBadge.appendChild(statusText);
+                    li.appendChild(statusBadge);
+                }
                 li.appendChild(deleteBtn);
                 elements.historyList.appendChild(li);
             });
@@ -1463,13 +1531,16 @@
                     size: item.size
                 }
             });
-            if (!presign?.success || !presign.uploadUrl || !presign.fields || !presign.objectKey) {
+            const uploadMethod = String(presign?.method || "POST").toUpperCase();
+            const needsFields = uploadMethod !== "PUT";
+            if (!presign?.success || !presign.uploadUrl || !presign.objectKey || (needsFields && !presign.fields)) {
                 throw new Error("未获取到有效的OSS上传签名");
             }
 
             await new Promise((resolve, reject) => {
                 const xhr = new XMLHttpRequest();
-                xhr.open("POST", presign.uploadUrl, true);
+                xhr.open(uploadMethod, presign.uploadUrl, true);
+                xhr.withCredentials = false;
                 xhr.timeout = 20 * 60 * 1000;
                 item.xhr = xhr;
 
@@ -1487,15 +1558,29 @@
                         resolve();
                         return;
                     }
-                    reject(new Error(`OSS上传失败（${xhr.status}）`));
+                    const ossText = String(xhr.responseText || "").trim().slice(0, 180);
+                    reject(new Error(`OSS上传失败（${xhr.status}）${ossText ? `：${ossText}` : ""}`));
                 };
-                xhr.onerror = () => reject(new Error("OSS network error"));
+                xhr.onerror = () => reject(new Error("OSS network error（请检查OSS CORS、HTTPS协议与Endpoint）"));
                 xhr.ontimeout = () => reject(new Error("OSS timeout"));
                 xhr.onabort = () => reject(new Error("OSS aborted"));
 
+                if (uploadMethod === "PUT") {
+                    const uploadHeaders = (presign.uploadHeaders && typeof presign.uploadHeaders === "object")
+                        ? presign.uploadHeaders
+                        : {};
+                    Object.entries(uploadHeaders).forEach(([key, value]) => {
+                        if (value !== undefined && value !== null && key) {
+                            xhr.setRequestHeader(String(key), String(value));
+                        }
+                    });
+                    xhr.send(item.file);
+                    return;
+                }
+
                 const formData = new FormData();
                 Object.entries(presign.fields || {}).forEach(([key, value]) => {
-                    formData.append(key, String(value));
+                    formData.append(String(key), String(value));
                 });
                 formData.append("file", item.file, item.name);
                 xhr.send(formData);
@@ -1612,38 +1697,59 @@
             }
         }
 
-        function startThinkingProgress(expectedMs) {
+        function getActiveRequestState() {
+            const conversation = getActiveConversation();
+            if (!conversation) return null;
+            return activeRequests.get(conversation.id) || null;
+        }
+
+        function syncThinkingProgress() {
             clearThinkingProgress();
-            const totalMs = Math.max(15_000, Number(expectedMs) || THINKING_MODE_TIMEOUT_MS[DEFAULT_THINKING_MODE]);
-            const startedAt = Date.now();
+            const requestState = getActiveRequestState();
+            if (!requestState) {
+                elements.thinkingStatus.hidden = true;
+                elements.thinkingBar.style.width = "0";
+                elements.thinkingEta.textContent = i18n[currentLang].thinkingEta.replace("{s}", "--");
+                return;
+            }
+
+            const totalMs = Math.max(15_000, Number(requestState.timeoutMs) || THINKING_MODE_TIMEOUT_MS[DEFAULT_THINKING_MODE]);
+            const startedAt = Number(requestState.startedAt) || Date.now();
 
             elements.thinkingStatus.hidden = false;
             elements.thinkingBar.style.width = "2%";
             elements.thinkingText.textContent = i18n[currentLang].thinkingStatus;
             elements.thinkingEta.textContent = i18n[currentLang].thinkingEta.replace("{s}", String(Math.ceil(totalMs / 1000)));
 
-            thinkingProgressTimer = setInterval(() => {
+            const tick = () => {
                 const elapsed = Date.now() - startedAt;
                 const ratio = Math.min(0.95, elapsed / totalMs);
                 const percent = Math.max(2, Math.floor(ratio * 100));
                 const remainSec = Math.max(0, Math.ceil((totalMs - elapsed) / 1000));
                 elements.thinkingBar.style.width = `${percent}%`;
                 elements.thinkingEta.textContent = i18n[currentLang].thinkingEta.replace("{s}", String(remainSec));
-            }, 250);
+            };
+            tick();
+            thinkingProgressTimer = setInterval(tick, 250);
         }
 
-        function finishThinkingProgress() {
-            clearThinkingProgress();
-            elements.thinkingBar.style.width = "100%";
-            elements.thinkingEta.textContent = i18n[currentLang].thinkingEta.replace("{s}", "0");
-            setTimeout(() => {
-                elements.thinkingStatus.hidden = true;
-                elements.thinkingBar.style.width = "0";
-            }, 320);
+        function startThinkingProgress(conversationId, expectedMs) {
+            activeRequests.set(conversationId, {
+                conversationId,
+                startedAt: Date.now(),
+                timeoutMs: expectedMs
+            });
+            syncThinkingProgress();
+        }
+
+        function finishThinkingProgress(conversationId) {
+            activeRequests.delete(conversationId);
+            syncThinkingProgress();
         }
 
         function setAuthRequiredState() {
             clearThinkingProgress();
+            activeRequests.clear();
             elements.thinkingStatus.hidden = true;
             elements.thinkingBar.style.width = "0";
             clearPendingAttachments({ deleteRemote: false });
@@ -1700,17 +1806,22 @@
                     return data;
                 } catch (error) {
                     const message = String(error?.message || "");
+                    const isNetworkFailure = /failed to fetch|load failed|network|networkerror/i.test(message);
                     if (/aborted|timeout/i.test(message)) {
                         lastMessage = i18n[currentLang].timeoutError;
                         lastError = new Error(lastMessage);
-                    } else if (/failed to fetch|load failed|network|networkerror/i.test(message)) {
-                        lastMessage = `${i18n[currentLang].noBackend}（${endpoint}）`;
+                    } else if (isNetworkFailure) {
+                        const endpointUrl = new URL(endpoint, window.location.href);
+                        const sameOrigin = endpointUrl.origin === window.location.origin;
+                        lastMessage = sameOrigin
+                            ? `后端请求失败（${endpoint}）。可能是服务暂时不可用或被网关拦截。`
+                            : `跨域请求失败（${endpoint}）。请检查后端 CORS 配置是否放行当前前端域名。`;
                         lastError = new Error(lastMessage);
                     } else {
                         lastMessage = message || lastMessage;
                         lastError = error instanceof Error ? error : new Error(lastMessage);
                     }
-                    const canRetry = !isLast && /failed to fetch|load failed|network|networkerror/i.test(lastMessage);
+                    const canRetry = !isLast && isNetworkFailure;
                     if (canRetry) {
                         clearTimeout(timeout);
                         continue;
@@ -1774,6 +1885,10 @@
             if (!text && attachmentsSnapshot.length === 0) return;
 
             const activeConversation = ensureActiveConversation();
+            if (activeRequests.has(activeConversation.id)) {
+                alert(i18n[currentLang].conversationBusy);
+                return;
+            }
             const historySnapshot = getConversationHistorySnapshot(activeConversation, 0);
             const userPreview = buildUserPreview(text, attachmentsSnapshot);
             const selectedThinkingMode = readThinkingMode();
@@ -1786,14 +1901,9 @@
 
             elements.inputField.value = "";
             elements.inputField.style.height = "auto";
-            elements.inputField.disabled = true;
-            elements.sendBtn.disabled = true;
-            elements.attachBtn.disabled = true;
-            elements.attachmentInput.disabled = true;
-            elements.attachmentList.style.pointerEvents = "none";
-            startThinkingProgress(timeoutMs);
-
-            const aiContentNode = appendAiMessage("正在生成专业法律分析，请稍候...");
+            clearPendingAttachments({ deleteRemote: false });
+            startThinkingProgress(activeConversation.id, timeoutMs);
+            renderConversationMessages();
             try {
                 const reply = await requestChat(
                     text,
@@ -1802,24 +1912,25 @@
                     historySnapshot,
                     timeoutMs
                 );
-                aiContentNode.textContent = reply;
                 addMessageToConversation(activeConversation.id, "ai", reply);
-                clearPendingAttachments({ deleteRemote: false });
                 renderHistoryList();
+                if (getActiveConversation()?.id === activeConversation.id) {
+                    renderConversationMessages();
+                }
             } catch (error) {
                 const errorMessage = `调用失败：${error.message}`;
-                aiContentNode.textContent = errorMessage;
                 addMessageToConversation(activeConversation.id, "ai", errorMessage);
                 renderHistoryList();
+                if (getActiveConversation()?.id === activeConversation.id) {
+                    renderConversationMessages();
+                }
             } finally {
-                finishThinkingProgress();
-                elements.inputField.disabled = false;
-                elements.sendBtn.disabled = false;
-                elements.attachBtn.disabled = false;
-                elements.attachmentInput.disabled = false;
-                elements.attachmentList.style.pointerEvents = "auto";
-                elements.inputField.focus();
-                elements.chatBox.scrollTop = elements.chatBox.scrollHeight;
+                finishThinkingProgress(activeConversation.id);
+                if (getActiveConversation()?.id === activeConversation.id) {
+                    elements.inputField.focus();
+                    elements.chatBox.scrollTop = elements.chatBox.scrollHeight;
+                }
+                renderHistoryList();
             }
         }
 
