@@ -193,7 +193,8 @@ function verifyPasswordHash(rawPassword, expectedHash) {
 }
 
 const NODE_ENV = process.env.NODE_ENV || "development";
-const PORT = readPositiveInt("PORT", 3000);
+const PORT = readPositiveInt("PORT", 10000);
+const HOST = "0.0.0.0";
 const REQUEST_TIMEOUT_MS = readPositiveInt("REQUEST_TIMEOUT_MS", 90_000);
 const MIN_REQUEST_TIMEOUT_MS = readPositiveInt("MIN_REQUEST_TIMEOUT_MS", 20_000);
 const MAX_REQUEST_TIMEOUT_MS = readPositiveInt("MAX_REQUEST_TIMEOUT_MS", 300_000);
@@ -3098,9 +3099,9 @@ function setRateLimitHeaders(res, limit, remaining, resetAt) {
   res.setHeader("X-RateLimit-Reset", String(Math.ceil(resetAt / 1000)));
 }
 
-app.listen(PORT, () => {
+app.listen(PORT, HOST, () => {
   console.log("✅ 汉盛智能后端服务器已成功启动！");
-  console.log(`👉 监听地址：http://localhost:${PORT}`);
+  console.log(`👉 监听地址：http://${HOST}:${PORT}`);
   console.log(`👉 默认模型：${DEFAULT_MODEL}`);
   console.log(`👉 可选模型：${ALLOWED_MODELS.join(", ")}`);
   console.log(`👉 上下文记忆条数：${CONTEXT_MAX_MESSAGES > 0 ? CONTEXT_MAX_MESSAGES : "不限制"}`);
