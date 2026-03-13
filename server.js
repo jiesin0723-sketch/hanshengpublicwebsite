@@ -9,6 +9,7 @@ const multer = require("multer");
 const OSS = require("ali-oss");
 const OpenApi = require("@alicloud/openapi-client");
 const AlibabaCloudDocMind = require("@alicloud/docmind-api20220711");
+const TeaUtil = require("@alicloud/tea-util");
 const mammoth = require("mammoth");
 const XLSX = require("xlsx");
 const WordExtractor = require("word-extractor");
@@ -242,7 +243,7 @@ const OSS_PRESIGN_EXPIRE_SECONDS = readPositiveInt("OSS_PRESIGN_EXPIRE_SECONDS",
 const OSS_FETCH_TIMEOUT_MS = readPositiveInt("OSS_FETCH_TIMEOUT_MS", 180_000);
 const OSS_FORCE_HTTPS = readBool("OSS_FORCE_HTTPS", true);
 const OSS_PUBLIC_BASE_URL = String(process.env.OSS_PUBLIC_BASE_URL || "").trim();
-const DOCMIND_ENDPOINT = String(process.env.DOCMIND_ENDPOINT || process.env.OCR_ENDPOINT || "docmind-api.cn-hangzhou.aliyuncs.com").trim();
+const DOCMIND_ENDPOINT = "docmind-api.cn-hangzhou.aliyuncs.com";
 const DOCMIND_REGION_ID = String(process.env.DOCMIND_REGION_ID || process.env.OCR_REGION_ID || "cn-hangzhou").trim();
 const OSS_SIGNED_URL_EXPIRE_SECONDS = readPositiveInt("OSS_SIGNED_URL_EXPIRE_SECONDS", 3600);
 const OSS_REGION = String(process.env.OSS_REGION || detectOssRegion()).trim();
@@ -946,6 +947,13 @@ async function submitDocMindStructureJob({ signedUrl, fileName }) {
 async function pollDocMindStructureResult(jobId, progressReporter = null) {
   const client = getAliyunDocMindClient();
   const maxAttempts = Math.max(1, DOCMIND_POLL_MAX_ATTEMPTS);
+  const RuntimeOptions = TeaUtil.RuntimeOptions;
+  const runtime = new RuntimeOptions({
+    connectTimeout: 15000,
+    readTimeout: 30000,
+    autoretry: true,
+    maxAttempts: 3,
+  });
   let attempt = 0;
   while (attempt < maxAttempts) {
     attempt += 1;
@@ -957,7 +965,7 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
     let response = null;
     try {
       response = await withTimeout(
-        runDocMindWithRetry("get-doc-structure-result", () => client.getDocStructureResult(request)),
+        runDocMindWithRetry("get-doc-structure-result", () => client.getDocStructureResultWithOptions(request, runtime)),
         DOCMIND_HTTP_TIMEOUT_MS
       );
     } catch (error) {
