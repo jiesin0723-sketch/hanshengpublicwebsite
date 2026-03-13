@@ -914,10 +914,52 @@ function parseStructuredOcrDataString(dataString) {
   };
 }
 
-async function recognizeDocumentStructureWithAliyun(fileUrl) {
+function buildOcrInputSource({ filePath = "", fileUrl = "" } = {}) {
+  const normalizedPath = String(filePath || "").trim();
+  if (normalizedPath) {
+    return {
+      requestSource: {
+        body: fs.createReadStream(normalizedPath),
+      },
+      sourceMode: "body",
+    };
+  }
+  const normalizedUrl = String(fileUrl || "").trim();
+  if (normalizedUrl) {
+    return {
+      requestSource: {
+        url: normalizedUrl,
+      },
+      sourceMode: "url",
+    };
+  }
+  throw createTaggedError(
+    "SCANNED_PDF_OCR_FAILED",
+    "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+    "missing OCR input source",
+    400
+  );
+}
+
+function createAliyunOcrResponseError(responseCode, detail) {
+  const numericStatus = Number(responseCode);
+  const statusCode = Number.isFinite(numericStatus) && numericStatus >= 400 && numericStatus < 600
+    ? numericStatus
+    : 502;
+  return createTaggedError(
+    "SCANNED_PDF_OCR_FAILED",
+    "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+    String(detail || responseCode || "OCR failed"),
+    statusCode
+  );
+}
+
+async function recognizeDocumentStructureWithAliyun({ filePath = "", fileUrl = "" } = {}) {
   const client = getAliyunOcrClient();
+  const { requestSource, sourceMode } = buildOcrInputSource({ filePath, fileUrl });
+  console.log(`[审计] OCR调用: document-structure mode=${sourceMode}`);
   const request = new AlibabaCloudOcr.RecognizeDocumentStructureRequest({
-    url: fileUrl,
+    ...requestSource,
     needSortPage: true,
     outputTable: true,
     page: true,
@@ -928,20 +970,17 @@ async function recognizeDocumentStructureWithAliyun(fileUrl) {
   const response = await withTimeout(client.recognizeDocumentStructure(request), OCR_TIMEOUT_MS);
   const responseCode = String(response?.body?.code || "").trim();
   if (responseCode && responseCode !== "200") {
-    throw createTaggedError(
-      "SCANNED_PDF_OCR_FAILED",
-      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
-      String(response?.body?.message || responseCode),
-      502
-    );
+    throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
   }
   return parseStructuredOcrDataString(response?.body?.data || "");
 }
 
-async function recognizeAllTextTableWithAliyun(fileUrl) {
+async function recognizeAllTextTableWithAliyun({ filePath = "", fileUrl = "" } = {}) {
   const client = getAliyunOcrClient();
+  const { requestSource, sourceMode } = buildOcrInputSource({ filePath, fileUrl });
+  console.log(`[审计] OCR调用: all-text-table mode=${sourceMode}`);
   const request = new AlibabaCloudOcr.RecognizeAllTextRequest({
-    url: fileUrl,
+    ...requestSource,
     type: "Advanced",
     outputCoordinate: "true",
     tableConfig: new AlibabaCloudOcr.RecognizeAllTextRequestTableConfig({
@@ -958,12 +997,7 @@ async function recognizeAllTextTableWithAliyun(fileUrl) {
   const response = await withTimeout(client.recognizeAllText(request), OCR_TIMEOUT_MS);
   const responseCode = String(response?.body?.code || "").trim();
   if (responseCode && responseCode !== "200") {
-    throw createTaggedError(
-      "SCANNED_PDF_OCR_FAILED",
-      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
-      String(response?.body?.message || responseCode),
-      502
-    );
+    throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
   }
   const payload = response?.body?.data || null;
   const tableDetails = collectTableDetailsDeep(payload, []);
@@ -996,7 +1030,13 @@ async function runAliyunOcrWithRetry(label, task) {
       return await task();
     } catch (error) {
       lastError = error;
-      const retryable = isTransientError(error);
+      const statusCode = Number(error?.statusCode || 0);
+      const detail = normalizeErrorMessage(error).toLowerCase();
+      const deterministicClientError =
+        (statusCode >= 400 && statusCode < 500) ||
+        detail.includes("illegalimageurl") ||
+        detail.includes("invalid url");
+      const retryable = !deterministicClientError && isTransientError(error);
       if (!retryable || attempt >= OCR_NETWORK_RETRY_ATTEMPTS) {
         throw error;
       }
@@ -1008,9 +1048,9 @@ async function runAliyunOcrWithRetry(label, task) {
   throw lastError || new Error(`OCR ${label} failed`);
 }
 
-async function recognizePdfTextWithAliyunOcr(fileUrl) {
+async function recognizePdfTextWithAliyunOcr({ filePath = "", fileUrl = "" } = {}) {
   const primary = await runAliyunOcrWithRetry("document-structure", () =>
-    recognizeDocumentStructureWithAliyun(fileUrl)
+    recognizeDocumentStructureWithAliyun({ filePath, fileUrl })
   );
   const hasStructuredRows = Array.isArray(primary?.structuredLines) && primary.structuredLines.length > 0;
   if (hasStructuredRows) {
@@ -1018,7 +1058,7 @@ async function recognizePdfTextWithAliyunOcr(fileUrl) {
   }
 
   const secondary = await runAliyunOcrWithRetry("all-text-table", () =>
-    recognizeAllTextTableWithAliyun(fileUrl)
+    recognizeAllTextTableWithAliyun({ filePath, fileUrl })
   );
   const merged = mergeStructuredOcrOutputs(primary, secondary);
   const finalText = merged.structuredLines.length > 0
@@ -1038,11 +1078,13 @@ async function recognizePdfTextWithAliyunOcr(fileUrl) {
     .trim();
 }
 
-async function recognizePdfTextWithAliyunAdvanced(fileUrl) {
+async function recognizePdfTextWithAliyunAdvanced({ filePath = "", fileUrl = "" } = {}) {
   const response = await runAliyunOcrWithRetry("advanced", async () => {
     const client = getAliyunOcrClient();
+    const { requestSource, sourceMode } = buildOcrInputSource({ filePath, fileUrl });
+    console.log(`[审计] OCR调用: advanced mode=${sourceMode}`);
     const request = new AlibabaCloudOcr.RecognizeAdvancedRequest({
-      url: fileUrl,
+      ...requestSource,
       needSortPage: true,
       paragraph: true,
       row: true,
@@ -1051,12 +1093,7 @@ async function recognizePdfTextWithAliyunAdvanced(fileUrl) {
   });
   const responseCode = String(response?.body?.code || "").trim();
   if (responseCode && responseCode !== "200") {
-    throw createTaggedError(
-      "SCANNED_PDF_OCR_FAILED",
-      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
-      String(response?.body?.message || responseCode),
-      502
-    );
+    throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
   }
   const extracted = extractTextFromAliyunOcrPayload(response?.body?.data || "");
   if (!extracted) {
@@ -1107,10 +1144,10 @@ async function extractTextWithFallback(filePath, fileUrl = "", progressReporter 
   }
   let ocrText = "";
   try {
-    ocrText = await recognizePdfTextWithAliyunOcr(fileUrl);
+    ocrText = await recognizePdfTextWithAliyunOcr({ filePath, fileUrl });
   } catch (error) {
     console.warn("[审计] 文档结构化 OCR 未得到可用表格结果，将回退全文 OCR：", normalizeErrorMessage(error));
-    ocrText = await recognizePdfTextWithAliyunAdvanced(fileUrl);
+    ocrText = await recognizePdfTextWithAliyunAdvanced({ filePath, fileUrl });
   }
   return {
     rawText: ocrText,
