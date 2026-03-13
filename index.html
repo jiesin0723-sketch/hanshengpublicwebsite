@@ -269,6 +269,7 @@
         .attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
         .attachment-status { font-size: 11px; color: rgba(215, 246, 255, 0.86); }
         .attachment-status.uploading { color: #8ce8ff; }
+        .attachment-status.processing { color: #ffe08c; }
         .attachment-status.success { color: #97f5bc; }
         .attachment-status.error { color: #ffb3b3; }
         .attachment-remove { border: none; background: transparent; color: rgba(215, 246, 255, 0.9); cursor: pointer; font-size: 14px; line-height: 1; padding: 0; }
@@ -604,6 +605,7 @@
                 uploadFailed: "上传失败",
                 uploadSuccess: "上传成功",
                 uploading: "上传中 {p}%",
+                uploadFinalizing: "回填中...",
                 replyPending: "正在生成专业法律分析，请稍候...",
                 conversationBusy: "当前对话仍在处理中，请稍候，或切换到其他窗口继续提问。",
                 processingTag: "处理中",
@@ -643,6 +645,7 @@
                 uploadFailed: "Upload failed",
                 uploadSuccess: "Uploaded",
                 uploading: "Uploading {p}%",
+                uploadFinalizing: "Finalizing...",
                 replyPending: "Generating professional legal analysis...",
                 conversationBusy: "This conversation is still processing. Wait or switch to another conversation.",
                 processingTag: "Processing",
@@ -1367,6 +1370,9 @@
             if (item.status === "uploading") {
                 return i18n[currentLang].uploading.replace("{p}", String(item.progress || 0));
             }
+            if (item.status === "processing") {
+                return i18n[currentLang].uploadFinalizing;
+            }
             if (item.status === "success") {
                 return i18n[currentLang].uploadSuccess;
             }
@@ -1475,6 +1481,30 @@
             item.file = null;
             item.xhr = null;
             renderAttachmentList();
+        }
+
+        async function requestUploadCompleteWithRetry(payload, maxAttempts = 2) {
+            let lastError = null;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                try {
+                    return await requestBackend("/api/uploads/complete", {
+                        method: "POST",
+                        requireAuth: true,
+                        timeoutMs: 30_000,
+                        body: payload
+                    });
+                } catch (error) {
+                    lastError = error;
+                    const message = String(error?.message || "");
+                    const statusCode = Number(error?.statusCode || 0);
+                    const retryable = attempt < maxAttempts && (statusCode >= 500 || /timeout|network|failed to fetch|load failed/i.test(message));
+                    if (!retryable) {
+                        throw error;
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+                }
+            }
+            throw lastError || new Error("OSS回填失败");
         }
 
         async function uploadAttachmentViaBackend(item, conversationId) {
@@ -1588,17 +1618,17 @@
                 xhr.send(formData);
             });
 
-            const completeData = await requestBackend("/api/uploads/complete", {
-                method: "POST",
-                requireAuth: true,
-                timeoutMs: 180_000,
-                body: {
-                    conversationId,
-                    objectKey: presign.objectKey,
-                    fileName: item.name,
-                    mimeType: item.mimeType,
-                    size: item.size
-                }
+            item.status = "processing";
+            item.progress = 98;
+            item.xhr = null;
+            renderAttachmentList();
+
+            const completeData = await requestUploadCompleteWithRetry({
+                conversationId,
+                objectKey: presign.objectKey,
+                fileName: item.name,
+                mimeType: item.mimeType,
+                size: item.size
             });
             if (!completeData?.success || !completeData?.attachment?.id) {
                 throw new Error("OSS回填失败");
@@ -1923,7 +1953,7 @@
                 return;
             }
             const text = elements.inputField.value.trim();
-            const uploadingCount = pendingAttachments.filter((item) => item.status === "uploading").length;
+            const uploadingCount = pendingAttachments.filter((item) => item.status === "uploading" || item.status === "processing").length;
             if (uploadingCount > 0) {
                 alert(i18n[currentLang].uploadInProgress);
                 return;

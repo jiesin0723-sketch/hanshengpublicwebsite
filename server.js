@@ -228,6 +228,8 @@ const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000
 const LARGE_PDF_PARSE_THRESHOLD_BYTES = readPositiveInt("LARGE_PDF_PARSE_THRESHOLD_BYTES", 8 * 1024 * 1024);
 const OCR_PDF_MIN_TEXT_CHARS = readPositiveInt("OCR_PDF_MIN_TEXT_CHARS", 200);
 const OCR_TIMEOUT_MS = readPositiveInt("OCR_TIMEOUT_MS", 120_000);
+const OCR_NETWORK_RETRY_ATTEMPTS = readPositiveInt("OCR_NETWORK_RETRY_ATTEMPTS", 3);
+const OCR_NETWORK_RETRY_BASE_DELAY_MS = readPositiveInt("OCR_NETWORK_RETRY_BASE_DELAY_MS", 1_500);
 const OSS_ENABLED = readBool("OSS_ENABLED", true);
 const OSS_BUCKET = String(process.env.OSS_BUCKET || "").trim();
 const OSS_ENDPOINT = String(process.env.OSS_ENDPOINT || "").trim();
@@ -987,14 +989,37 @@ function mergeStructuredOcrOutputs(primary, secondary) {
   };
 }
 
+async function runAliyunOcrWithRetry(label, task) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= OCR_NETWORK_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      return await task();
+    } catch (error) {
+      lastError = error;
+      const retryable = isTransientError(error);
+      if (!retryable || attempt >= OCR_NETWORK_RETRY_ATTEMPTS) {
+        throw error;
+      }
+      const waitMs = OCR_NETWORK_RETRY_BASE_DELAY_MS * attempt;
+      console.warn(`[审计] OCR网络重试: ${label} attempt=${attempt}/${OCR_NETWORK_RETRY_ATTEMPTS} wait=${waitMs}ms error=${normalizeErrorMessage(error)}`);
+      await delay(waitMs);
+    }
+  }
+  throw lastError || new Error(`OCR ${label} failed`);
+}
+
 async function recognizePdfTextWithAliyunOcr(fileUrl) {
-  const primary = await recognizeDocumentStructureWithAliyun(fileUrl);
+  const primary = await runAliyunOcrWithRetry("document-structure", () =>
+    recognizeDocumentStructureWithAliyun(fileUrl)
+  );
   const hasStructuredRows = Array.isArray(primary?.structuredLines) && primary.structuredLines.length > 0;
   if (hasStructuredRows) {
     return primary.structuredLines.join("\n");
   }
 
-  const secondary = await recognizeAllTextTableWithAliyun(fileUrl);
+  const secondary = await runAliyunOcrWithRetry("all-text-table", () =>
+    recognizeAllTextTableWithAliyun(fileUrl)
+  );
   const merged = mergeStructuredOcrOutputs(primary, secondary);
   const finalText = merged.structuredLines.length > 0
     ? merged.structuredLines.join("\n")
@@ -1014,14 +1039,16 @@ async function recognizePdfTextWithAliyunOcr(fileUrl) {
 }
 
 async function recognizePdfTextWithAliyunAdvanced(fileUrl) {
-  const client = getAliyunOcrClient();
-  const request = new AlibabaCloudOcr.RecognizeAdvancedRequest({
-    url: fileUrl,
-    needSortPage: true,
-    paragraph: true,
-    row: true,
+  const response = await runAliyunOcrWithRetry("advanced", async () => {
+    const client = getAliyunOcrClient();
+    const request = new AlibabaCloudOcr.RecognizeAdvancedRequest({
+      url: fileUrl,
+      needSortPage: true,
+      paragraph: true,
+      row: true,
+    });
+    return withTimeout(client.recognizeAdvanced(request), OCR_TIMEOUT_MS);
   });
-  const response = await withTimeout(client.recognizeAdvanced(request), OCR_TIMEOUT_MS);
   const responseCode = String(response?.body?.code || "").trim();
   if (responseCode && responseCode !== "200") {
     throw createTaggedError(
