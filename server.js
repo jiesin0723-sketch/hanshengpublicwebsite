@@ -6,6 +6,8 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const multer = require("multer");
+const OpenApi = require("@alicloud/openapi-client");
+const AlibabaCloudOcr = require("@alicloud/ocr-api20210707");
 const mammoth = require("mammoth");
 const XLSX = require("xlsx");
 const WordExtractor = require("word-extractor");
@@ -216,6 +218,8 @@ const CONTEXT_TTL_MS = readPositiveInt("CONTEXT_TTL_MS", 30 * 24 * 60 * 60 * 100
 const UPLOAD_ATTACHMENT_TTL_MS = readPositiveInt("UPLOAD_ATTACHMENT_TTL_MS", 24 * 60 * 60 * 1000);
 const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000);
 const LARGE_PDF_PARSE_THRESHOLD_BYTES = readPositiveInt("LARGE_PDF_PARSE_THRESHOLD_BYTES", 8 * 1024 * 1024);
+const OCR_PDF_MIN_TEXT_CHARS = readPositiveInt("OCR_PDF_MIN_TEXT_CHARS", 200);
+const OCR_TIMEOUT_MS = readPositiveInt("OCR_TIMEOUT_MS", 120_000);
 const OSS_ENABLED = readBool("OSS_ENABLED", true);
 const OSS_BUCKET = String(process.env.OSS_BUCKET || "").trim();
 const OSS_ENDPOINT = String(process.env.OSS_ENDPOINT || "").trim();
@@ -226,6 +230,8 @@ const OSS_PRESIGN_EXPIRE_SECONDS = readPositiveInt("OSS_PRESIGN_EXPIRE_SECONDS",
 const OSS_FETCH_TIMEOUT_MS = readPositiveInt("OSS_FETCH_TIMEOUT_MS", 180_000);
 const OSS_FORCE_HTTPS = readBool("OSS_FORCE_HTTPS", true);
 const OSS_PUBLIC_BASE_URL = String(process.env.OSS_PUBLIC_BASE_URL || "").trim();
+const OCR_ENDPOINT = String(process.env.OCR_ENDPOINT || "ocr-api.cn-hangzhou.aliyuncs.com").trim();
+const OCR_REGION_ID = String(process.env.OCR_REGION_ID || "cn-hangzhou").trim();
 
 const DEFAULT_ALLOWED_MODELS = [
   "gemini-3.1-pro-preview",
@@ -648,6 +654,387 @@ async function parsePdfToText(filePath) {
   return text;
 }
 
+function createTaggedError(code, message, detail = "", statusCode = 500) {
+  const error = new Error(message);
+  error.code = code;
+  error.detail = detail;
+  error.statusCode = statusCode;
+  return error;
+}
+
+let ocrClientInstance = null;
+
+function getAliyunOcrClient() {
+  if (ocrClientInstance) return ocrClientInstance;
+  if (!OSS_ACCESS_KEY_ID || !OSS_ACCESS_KEY_SECRET) {
+    throw createTaggedError("OCR_NOT_CONFIGURED", "扫描件文字识别失败，请确认服务端 OCR 配置完整。", "", 500);
+  }
+  const config = new OpenApi.Config({
+    accessKeyId: OSS_ACCESS_KEY_ID,
+    accessKeySecret: OSS_ACCESS_KEY_SECRET,
+    endpoint: OCR_ENDPOINT,
+    regionId: OCR_REGION_ID,
+  });
+  ocrClientInstance = new AlibabaCloudOcr.default(config);
+  return ocrClientInstance;
+}
+
+function extractTextFromAliyunOcrPayload(payload) {
+  if (!payload) return "";
+  if (typeof payload === "string") {
+    try {
+      return extractTextFromAliyunOcrPayload(JSON.parse(payload));
+    } catch {
+      return payload.trim();
+    }
+  }
+  if (typeof payload !== "object") return "";
+
+  const content = String(payload.content || payload.Content || "").trim();
+  if (content) return content;
+
+  if (Array.isArray(payload.prism_wordsInfo) && payload.prism_wordsInfo.length > 0) {
+    return payload.prism_wordsInfo
+      .map((item) => String(item?.word || "").trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (Array.isArray(payload.wordsInfo) && payload.wordsInfo.length > 0) {
+    return payload.wordsInfo
+      .map((item) => String(item?.word || "").trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  return "";
+}
+
+function collectTableDetailsDeep(value, results = []) {
+  if (!value || typeof value !== "object") return results;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectTableDetailsDeep(item, results);
+    }
+    return results;
+  }
+  if (Array.isArray(value.tableDetails)) {
+    for (const item of value.tableDetails) {
+      if (item && typeof item === "object") results.push(item);
+    }
+  }
+  for (const nested of Object.values(value)) {
+    collectTableDetailsDeep(nested, results);
+  }
+  return results;
+}
+
+const OCR_TABLE_HEADER_ALIASES = {
+  "交易日期": ["交易日期", "记账日期", "入账日期", "日期", "交易时间", "交易日", "记账日", "发生日期", "交易日期时间"],
+  "收入": ["收入", "贷方", "贷记", "入账", "转入", "收款金额", "收入金额", "credit", "deposit", "incoming"],
+  "支出": ["支出", "借方", "借记", "出账", "转出", "付款金额", "支出金额", "debit", "payment", "outgoing"],
+  "余额": ["余额", "账户余额", "可用余额", "本次余额", "balance", "available balance"],
+  "对手方": ["对手方", "对方户名", "对方名称", "交易对手", "对方账号名称", "付款方", "收款方", "户名", "对方账户", "counterparty"],
+  "摘要": ["摘要", "备注", "附言", "用途", "说明", "交易摘要", "摘要说明", "摘要内容", "memo", "remark", "note", "description"],
+};
+
+function normalizeHeaderToken(value) {
+  return normalizeFinancialCell(value)
+    .toLowerCase()
+    .replace(/[():：_\-]/g, "")
+    .trim();
+}
+
+function resolveCanonicalHeader(value) {
+  const normalized = normalizeHeaderToken(value);
+  if (!normalized) return "";
+  for (const [canonical, aliases] of Object.entries(OCR_TABLE_HEADER_ALIASES)) {
+    if (aliases.some((alias) => normalized.includes(normalizeHeaderToken(alias)))) {
+      return canonical;
+    }
+  }
+  return "";
+}
+
+function scoreHeaderRow(rowValues) {
+  let score = 0;
+  const columnMappings = new Map();
+  rowValues.forEach((value, index) => {
+    const canonical = resolveCanonicalHeader(value);
+    if (canonical && !columnMappings.has(canonical)) {
+      columnMappings.set(canonical, index);
+      score += 1;
+    }
+  });
+  return { score, columnMappings };
+}
+
+function buildLinesFromOcrTableDetails(tableDetails) {
+  if (!Array.isArray(tableDetails) || tableDetails.length === 0) return [];
+  const output = [];
+
+  for (const table of tableDetails) {
+    const cells = Array.isArray(table?.cellDetails) ? table.cellDetails : [];
+    if (cells.length === 0) continue;
+
+    const rowMap = new Map();
+    for (const cell of cells) {
+      const rowIndex = Number.isFinite(Number(cell?.rowStart)) ? Number(cell.rowStart) : -1;
+      const columnIndex = Number.isFinite(Number(cell?.columnStart)) ? Number(cell.columnStart) : 0;
+      const content = normalizeFinancialCell(cell?.cellContent || "");
+      if (rowIndex < 0 || !content) continue;
+      if (!rowMap.has(rowIndex)) rowMap.set(rowIndex, []);
+      rowMap.get(rowIndex).push({ columnIndex, content });
+    }
+
+    const sortedRows = [...rowMap.entries()].sort((a, b) => a[0] - b[0]);
+    const normalizedRows = sortedRows.map(([rowIndex, rowCells]) => ({
+      rowIndex,
+      values: rowCells
+        .sort((a, b) => a.columnIndex - b.columnIndex)
+        .map((cell) => cell.content)
+        .filter(Boolean),
+    }));
+
+    let headerRowIndex = -1;
+    let headerColumns = new Map();
+    let bestScore = 0;
+    normalizedRows.slice(0, 4).forEach((row) => {
+      const headerScore = scoreHeaderRow(row.values);
+      if (headerScore.score > bestScore) {
+        bestScore = headerScore.score;
+        headerRowIndex = row.rowIndex;
+        headerColumns = headerScore.columnMappings;
+      }
+    });
+
+    const hasMappedHeaders = bestScore >= 2;
+    for (const row of normalizedRows) {
+      if (row.values.length === 0) continue;
+      if (hasMappedHeaders && row.rowIndex === headerRowIndex) continue;
+
+      if (hasMappedHeaders) {
+        const line = [
+          row.values[headerColumns.get("交易日期")] || "",
+          row.values[headerColumns.get("收入")] || "",
+          row.values[headerColumns.get("支出")] || "",
+          row.values[headerColumns.get("余额")] || "",
+          row.values[headerColumns.get("对手方")] || "",
+          row.values[headerColumns.get("摘要")] || "",
+        ]
+          .map((value) => normalizeFinancialCell(value))
+          .join(" | ");
+        if (line.replace(/\s|\|/g, "").length > 0) {
+          output.push(line);
+          continue;
+        }
+      }
+
+      output.push(row.values.join(" | "));
+    }
+  }
+
+  return output;
+}
+
+function parseStructuredOcrDataString(dataString) {
+  if (!dataString) {
+    return { payload: null, structuredLines: [], text: "" };
+  }
+  let payload = null;
+  try {
+    payload = typeof dataString === "string" ? JSON.parse(dataString) : dataString;
+  } catch {
+    const rawText = typeof dataString === "string" ? dataString.trim() : "";
+    return { payload: null, structuredLines: [], text: rawText };
+  }
+
+  const tableDetails = collectTableDetailsDeep(payload, []);
+  const structuredLines = buildLinesFromOcrTableDetails(tableDetails);
+  const plainText = extractTextFromAliyunOcrPayload(payload);
+  return {
+    payload,
+    structuredLines,
+    text: plainText,
+  };
+}
+
+async function recognizeDocumentStructureWithAliyun(fileUrl) {
+  const client = getAliyunOcrClient();
+  const request = new AlibabaCloudOcr.RecognizeDocumentStructureRequest({
+    url: fileUrl,
+    needSortPage: true,
+    outputTable: true,
+    page: true,
+    paragraph: true,
+    row: true,
+    useNewStyleOutput: true,
+  });
+  const response = await withTimeout(client.recognizeDocumentStructure(request), OCR_TIMEOUT_MS);
+  const responseCode = String(response?.body?.code || "").trim();
+  if (responseCode && responseCode !== "200") {
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+      String(response?.body?.message || responseCode),
+      502
+    );
+  }
+  return parseStructuredOcrDataString(response?.body?.data || "");
+}
+
+async function recognizeAllTextTableWithAliyun(fileUrl) {
+  const client = getAliyunOcrClient();
+  const request = new AlibabaCloudOcr.RecognizeAllTextRequest({
+    url: fileUrl,
+    type: "Advanced",
+    outputCoordinate: "true",
+    tableConfig: new AlibabaCloudOcr.RecognizeAllTextRequestTableConfig({
+      outputTableHtml: true,
+      outputTableExcel: false,
+      isLineLessTable: false,
+      isHandWritingTable: false,
+    }),
+    outputFigure: false,
+    outputBarCode: false,
+    outputStamp: false,
+    outputQrcode: false,
+  });
+  const response = await withTimeout(client.recognizeAllText(request), OCR_TIMEOUT_MS);
+  const responseCode = String(response?.body?.code || "").trim();
+  if (responseCode && responseCode !== "200") {
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+      String(response?.body?.message || responseCode),
+      502
+    );
+  }
+  const payload = response?.body?.data || null;
+  const tableDetails = collectTableDetailsDeep(payload, []);
+  const structuredLines = buildLinesFromOcrTableDetails(tableDetails);
+  const plainText = extractTextFromAliyunOcrPayload(payload);
+  return {
+    payload,
+    structuredLines,
+    text: plainText,
+  };
+}
+
+function mergeStructuredOcrOutputs(primary, secondary) {
+  const primaryLines = Array.isArray(primary?.structuredLines) ? primary.structuredLines : [];
+  const secondaryLines = Array.isArray(secondary?.structuredLines) ? secondary.structuredLines : [];
+  const mergedLines = primaryLines.length > 0 ? primaryLines : secondaryLines;
+  const mergedText = [String(primary?.text || "").trim(), String(secondary?.text || "").trim()]
+    .filter(Boolean)
+    .join("\n");
+  return {
+    structuredLines: [...new Set(mergedLines.map((line) => String(line || "").trim()).filter(Boolean))],
+    text: mergedText.trim(),
+  };
+}
+
+async function recognizePdfTextWithAliyunOcr(fileUrl) {
+  const primary = await recognizeDocumentStructureWithAliyun(fileUrl);
+  const hasStructuredRows = Array.isArray(primary?.structuredLines) && primary.structuredLines.length > 0;
+  if (hasStructuredRows) {
+    return primary.structuredLines.join("\n");
+  }
+
+  const secondary = await recognizeAllTextTableWithAliyun(fileUrl);
+  const merged = mergeStructuredOcrOutputs(primary, secondary);
+  const finalText = merged.structuredLines.length > 0
+    ? merged.structuredLines.join("\n")
+    : merged.text;
+  if (!finalText) {
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+      "OCR empty result",
+      502
+    );
+  }
+  return finalText
+    .replace(/\u0000/g, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+}
+
+async function recognizePdfTextWithAliyunAdvanced(fileUrl) {
+  const client = getAliyunOcrClient();
+  const request = new AlibabaCloudOcr.RecognizeAdvancedRequest({
+    url: fileUrl,
+    needSortPage: true,
+    paragraph: true,
+    row: true,
+  });
+  const response = await withTimeout(client.recognizeAdvanced(request), OCR_TIMEOUT_MS);
+  const responseCode = String(response?.body?.code || "").trim();
+  if (responseCode && responseCode !== "200") {
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+      String(response?.body?.message || responseCode),
+      502
+    );
+  }
+  const extracted = extractTextFromAliyunOcrPayload(response?.body?.data || "");
+  if (!extracted) {
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+      "OCR empty result",
+      502
+    );
+  }
+  return extracted
+    .replace(/\u0000/g, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+}
+
+async function extractTextWithFallback(filePath, fileUrl = "") {
+  let pdfParsedText = "";
+  try {
+    pdfParsedText = await parsePdfToText(filePath);
+  } catch (error) {
+    console.warn("[审计] pdf-parse 提取失败，将尝试 OCR 兜底：", normalizeErrorMessage(error));
+  }
+
+  if (pdfParsedText.length === 0) {
+    console.warn("[审计] pdf-parse 提取字符数为 0，疑似扫描件 PDF");
+  }
+
+  if (pdfParsedText.length >= OCR_PDF_MIN_TEXT_CHARS) {
+    return {
+      rawText: pdfParsedText,
+      extractor: "pdf-parse",
+    };
+  }
+
+  if (!fileUrl) {
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+      "missing OCR file URL",
+      502
+    );
+  }
+
+  console.log("[审计] 触发阿里云 OCR 兜底识别");
+  let ocrText = "";
+  try {
+    ocrText = await recognizePdfTextWithAliyunOcr(fileUrl);
+  } catch (error) {
+    console.warn("[审计] 文档结构化 OCR 未得到可用表格结果，将回退全文 OCR：", normalizeErrorMessage(error));
+    ocrText = await recognizePdfTextWithAliyunAdvanced(fileUrl);
+  }
+  return {
+    rawText: ocrText,
+    extractor: "aliyun-ocr-structured",
+  };
+}
+
 function looksLikeFinancialPdf(name, text) {
   const nameText = String(name || "").toLowerCase();
   const preview = String(text || "").slice(0, 20_000).toLowerCase();
@@ -896,6 +1283,12 @@ function buildFinancialDataPayload({ rawText, attachmentName }) {
   let cleanedText = String(cleaned.text || "").trim();
   let truncated = false;
 
+  console.log(`[审计] 原始提取字符数: ${String(rawText || "").length}`);
+  console.log(`[审计] 正则清洗后字符数: ${cleanedText.length}`);
+  if (String(rawText || "").length === 0) {
+    console.warn("[审计] 原始提取字符数为 0，疑似扫描件 PDF");
+  }
+
   if (cleanedText.length > FINANCIAL_DATA_MAX_CHARS) {
     cleanedText = cleanedText.slice(0, FINANCIAL_DATA_MAX_CHARS);
     truncated = true;
@@ -1006,7 +1399,7 @@ async function uploadBinaryFileToGemini({ filePath, mimeType, displayName }) {
   return { fileUri, geminiFileName };
 }
 
-async function createUploadedAttachmentRecord({ file, userId, conversationId }) {
+async function createUploadedAttachmentRecord({ file, userId, conversationId, sourceFileUrl = "" }) {
   const name = normalizeFilename(file?.originalname, "附件");
   const mimeType = normalizeUploadMimeType(file?.mimetype, name);
   if (!mimeType) {
@@ -1062,7 +1455,8 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
     if (mimeType === "application/pdf") {
       const shouldPreferTextPath = Number(file?.size || 0) >= LARGE_PDF_PARSE_THRESHOLD_BYTES;
       try {
-        const pdfText = await parsePdfToText(file.path);
+        const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl);
+        const pdfText = extractedPdf.rawText;
         if (pdfText) {
           if (looksLikeFinancialPdf(name, pdfText)) {
             const financialPayload = buildFinancialDataPayload({
@@ -1089,6 +1483,9 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
           }
         }
       } catch (pdfParseError) {
+        if (String(pdfParseError?.code || "") === "SCANNED_PDF_OCR_FAILED") {
+          throw pdfParseError;
+        }
         if (shouldPreferTextPath) {
           throw new Error(`PDF 解析失败，无法进入轻量清洗链路：${normalizeErrorMessage(pdfParseError)}`);
         }
@@ -1110,7 +1507,8 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
         // PDF上传失败时，优先走文本解析兜底，避免用户上传即失败。
         if (mimeType === "application/pdf") {
           try {
-            const pdfText = await parsePdfToText(file.path);
+            const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl);
+            const pdfText = extractedPdf.rawText;
             if (pdfText) {
               record.kind = "text";
               record.mimeType = "text/plain";
@@ -1118,7 +1516,10 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
               record.textLimit = TEXT_EXTRACT_MAX_CHARS;
               return record;
             }
-          } catch {
+          } catch (fallbackPdfError) {
+            if (String(fallbackPdfError?.code || "") === "SCANNED_PDF_OCR_FAILED") {
+              throw fallbackPdfError;
+            }
             // continue fallback
           }
         }
@@ -1283,6 +1684,7 @@ async function handleUploadAttachment(req, res) {
       file: req.file,
       userId: req.authUser.id,
       conversationId,
+      sourceFileUrl: "",
     });
     uploadedAttachments.set(record.id, record);
 
@@ -1300,9 +1702,16 @@ async function handleUploadAttachment(req, res) {
   } catch (error) {
     const detail = normalizeErrorMessage(error);
     const badRequest = /不支持的附件类型/i.test(detail);
-    return res.status(badRequest ? 400 : 500).json({
+    const ocrFailed = String(error?.code || "") === "SCANNED_PDF_OCR_FAILED";
+    return res.status(ocrFailed ? 502 : badRequest ? 400 : 500).json({
+      status: "error",
       success: false,
-      message: badRequest ? "附件类型不受支持" : "附件解析或上传失败",
+      errorCode: ocrFailed ? "SCANNED_PDF_OCR_FAILED" : "",
+      message: ocrFailed
+        ? "扫描件文字识别失败，请确认图片清晰度或稍后再试。"
+        : badRequest
+        ? "附件类型不受支持"
+        : "附件解析或上传失败",
       error: detail,
     });
   }
@@ -1446,6 +1855,7 @@ async function handleUploadComplete(req, res) {
       },
       userId: req.authUser.id,
       conversationId,
+      sourceFileUrl: signedUrl,
     });
     uploadedAttachments.set(record.id, record);
 
@@ -1465,6 +1875,7 @@ async function handleUploadComplete(req, res) {
     const detail = normalizeErrorMessage(error);
     const isNetwork = isNetworkError(error);
     const isTimeout = /timeout|timed out|aborted/i.test(detail);
+    const ocrFailed = String(error?.code || "") === "SCANNED_PDF_OCR_FAILED";
     console.error(
       "OSS回填失败:",
       `user=${req.authUser.id}`,
@@ -1472,10 +1883,19 @@ async function handleUploadComplete(req, res) {
       `objectKey=${objectKey}`,
       detail
     );
-    return res.status(isNetwork || isTimeout ? 502 : 500).json({
+    return res.status(ocrFailed || isNetwork || isTimeout ? 502 : 500).json({
+      status: "error",
       success: false,
-      errorCode: isTimeout ? "OSS_FETCH_TIMEOUT" : isNetwork ? "OSS_FETCH_NETWORK_ERROR" : "OSS_COMPLETE_FAILED",
-      message: isTimeout
+      errorCode: ocrFailed
+        ? "SCANNED_PDF_OCR_FAILED"
+        : isTimeout
+        ? "OSS_FETCH_TIMEOUT"
+        : isNetwork
+        ? "OSS_FETCH_NETWORK_ERROR"
+        : "OSS_COMPLETE_FAILED",
+      message: ocrFailed
+        ? "扫描件文字识别失败，请确认图片清晰度或稍后再试。"
+        : isTimeout
         ? "直传文件回填超时，请稍后重试"
         : isNetwork
         ? "后端拉取 OSS 文件失败，请检查网络和 OSS 访问策略"
@@ -1764,6 +2184,14 @@ function parseUpstreamErrorPayload(error) {
 }
 
 function mapUpstreamError(error) {
+  if (String(error?.code || "") === "UPSTREAM_QUOTA_EXCEEDED") {
+    return {
+      statusCode: Number(error?.statusCode) || 429,
+      errorCode: "UPSTREAM_QUOTA_EXCEEDED",
+      userMessage: String(error?.message || "文件过大导致 AI 算力超限，请截取关键页后再试，或等待1分钟后重试。"),
+      detail: String(error?.detail || normalizeErrorMessage(error)),
+    };
+  }
   const payload = parseUpstreamErrorPayload(error);
   const raw = normalizeErrorMessage(error);
   const lower = raw.toLowerCase();
@@ -1778,7 +2206,7 @@ function mapUpstreamError(error) {
     return {
       statusCode: 429,
       errorCode: "UPSTREAM_QUOTA_EXCEEDED",
-      userMessage: "当前模型配额不足，请切换其他模型或稍后重试",
+      userMessage: "文件过大导致 AI 算力超限，请截取关键页后再试，或等待1分钟后重试。",
       detail: payload?.message || raw,
     };
   }
@@ -2221,20 +2649,33 @@ function shouldUsePlanAndSolvePipeline({ webSearch, timeoutMs, disablePlanAndSol
 }
 
 async function callGenerateOnce({ model, contents, webSearch, timeoutMs }) {
-  const response = await withTimeout(
-    ai.models.generateContent({
-      model,
-      contents,
-      config: buildGenerationConfig({ webSearch }),
-    }),
-    timeoutMs
-  );
+  try {
+    const response = await withTimeout(
+      ai.models.generateContent({
+        model,
+        contents,
+        config: buildGenerationConfig({ webSearch }),
+      }),
+      timeoutMs
+    );
 
-  const reply = typeof response.text === "string" ? response.text.trim() : "";
-  if (!reply) {
-    throw new Error(`模型 ${model} 未返回有效文本`);
+    const reply = typeof response.text === "string" ? response.text.trim() : "";
+    if (!reply) {
+      throw new Error(`模型 ${model} 未返回有效文本`);
+    }
+    return reply;
+  } catch (error) {
+    const raw = normalizeErrorMessage(error).toLowerCase();
+    if (raw.includes("quota exceeded") || raw.includes("rate limit") || raw.includes("resource_exhausted")) {
+      throw createTaggedError(
+        "UPSTREAM_QUOTA_EXCEEDED",
+        "文件过大导致 AI 算力超限，请截取关键页后再试，或等待1分钟后重试。",
+        normalizeErrorMessage(error),
+        429
+      );
+    }
+    throw error;
   }
-  return reply;
 }
 
 async function runTwoPassPlanAndSolve({ model, contents, timeoutMs, userMessage }) {
@@ -2439,6 +2880,7 @@ async function handleChat(req, res) {
       mappedError.detail
     );
     return res.status(mappedError.statusCode).json({
+      status: "error",
       success: false,
       errorCode: mappedError.errorCode,
       message: mappedError.userMessage,
