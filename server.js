@@ -198,6 +198,10 @@ const MAX_BASE64_ATTACHMENT_CHARS = readPositiveInt(
   Math.ceil((MAX_BINARY_ATTACHMENT_BYTES / 3) * 4) + 8
 );
 const MAX_TEXT_ATTACHMENT_CHARS = readPositiveInt("MAX_TEXT_ATTACHMENT_CHARS", 120_000);
+const FINANCIAL_DATA_MAX_CHARS = readPositiveInt("FINANCIAL_DATA_MAX_CHARS", 500_000);
+const FINANCIAL_SUMMARY_TRIGGER_CHARS = readPositiveInt("FINANCIAL_SUMMARY_TRIGGER_CHARS", 120_000);
+const FINANCIAL_SUMMARY_CHUNK_SIZE = readPositiveInt("FINANCIAL_SUMMARY_CHUNK_SIZE", 180);
+const FINANCIAL_DETAIL_KEEP_ROWS = readPositiveInt("FINANCIAL_DETAIL_KEEP_ROWS", 240);
 const JSON_BODY_LIMIT_MB = readPositiveInt("JSON_BODY_LIMIT_MB", 220);
 const HISTORY_MAX_MESSAGES = readPositiveInt("HISTORY_MAX_MESSAGES", 40);
 const HISTORY_MESSAGE_MAX_CHARS = readPositiveInt("HISTORY_MESSAGE_MAX_CHARS", 6000);
@@ -211,6 +215,7 @@ const CONTEXT_MAX_MESSAGES = readNonNegativeInt("CONTEXT_MAX_MESSAGES", 0);
 const CONTEXT_TTL_MS = readPositiveInt("CONTEXT_TTL_MS", 30 * 24 * 60 * 60 * 1000);
 const UPLOAD_ATTACHMENT_TTL_MS = readPositiveInt("UPLOAD_ATTACHMENT_TTL_MS", 24 * 60 * 60 * 1000);
 const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000);
+const LARGE_PDF_PARSE_THRESHOLD_BYTES = readPositiveInt("LARGE_PDF_PARSE_THRESHOLD_BYTES", 8 * 1024 * 1024);
 const OSS_ENABLED = readBool("OSS_ENABLED", true);
 const OSS_BUCKET = String(process.env.OSS_BUCKET || "").trim();
 const OSS_ENDPOINT = String(process.env.OSS_ENDPOINT || "").trim();
@@ -643,6 +648,348 @@ async function parsePdfToText(filePath) {
   return text;
 }
 
+function looksLikeFinancialPdf(name, text) {
+  const nameText = String(name || "").toLowerCase();
+  const preview = String(text || "").slice(0, 20_000).toLowerCase();
+  const keywords = [
+    "流水",
+    "银行",
+    "账户",
+    "交易",
+    "对账单",
+    "明细",
+    "借方",
+    "贷方",
+    "余额",
+    "证转银",
+    "finance",
+    "statement",
+    "transaction",
+    "account",
+    "debit",
+    "credit",
+    "balance",
+  ];
+  return keywords.some((keyword) => nameText.includes(keyword) || preview.includes(keyword));
+}
+
+function cleanFinancialPdfText(rawText) {
+  const lines = String(rawText || "")
+    .replace(/\u00a0/g, " ")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  const dateLineRegex = /(?:\b\d{4}[-/.年]?\d{2}[-/.月]?\d{2}(?:日)?\b|\b20[1-2]\d{5}\b)/;
+  const skipLineRegex = /^(?:第\s*\d+\s*页|page\s*\d+|打印日期|打印时间|交易流水明细|账户交易明细|账户明细表|银行声明|仅供参考|客户回单|电子回单|币种|开户行|开户地址|卡号|账号：|户名：|本页小计|本页合计)$/i;
+
+  const kept = [];
+  for (const line of lines) {
+    if (skipLineRegex.test(line)) continue;
+    if (!dateLineRegex.test(line)) continue;
+    kept.push(line);
+  }
+
+  return {
+    text: kept.join("\n"),
+    lineCount: kept.length,
+    originalLineCount: lines.length,
+  };
+}
+
+function normalizeFinancialCell(value) {
+  return String(value || "")
+    .replace(/[|｜]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractDateFromFinancialLine(line) {
+  const match = String(line || "").match(/(?:\b\d{4}[-/.年]?\d{2}[-/.月]?\d{2}(?:日)?\b|\b20[1-2]\d{5}\b)/);
+  return match ? normalizeFinancialCell(match[0]) : "";
+}
+
+function extractAmountsFromFinancialLine(line) {
+  return [...String(line || "").matchAll(/[+-]?\d{1,3}(?:,\d{3})*(?:\.\d{2})|[+-]?\d+\.\d{2}/g)]
+    .map((match) => String(match[0] || "").trim())
+    .filter((value) => /\d/.test(value));
+}
+
+function normalizeAmountToken(value) {
+  return String(value || "").replace(/,/g, "").trim();
+}
+
+function extractLabeledAmount(line, labels) {
+  const labelPattern = labels.map((item) => item.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const match = String(line || "").match(
+    new RegExp(`(?:${labelPattern})[:：\\s]*([+-]?\\d{1,3}(?:,\\d{3})*(?:\\.\\d{2})|[+-]?\\d+\\.\\d{2})`, "i")
+  );
+  return match?.[1] ? normalizeAmountToken(match[1]) : "";
+}
+
+function splitFinancialAmounts(line) {
+  const raw = String(line || "");
+  const normalizedAmounts = extractAmountsFromFinancialLine(raw).map(normalizeAmountToken);
+  let income = extractLabeledAmount(raw, ["贷方", "收入", "入账", "转入", "收入金额", "贷记"]);
+  let expense = extractLabeledAmount(raw, ["借方", "支出", "出账", "转出", "支出金额", "借记"]);
+  let balance = extractLabeledAmount(raw, ["余额", "可用余额", "账户余额", "本次余额"]);
+
+  const lower = raw.toLowerCase();
+  const isIncomeLine = /贷方|收入|入账|转入|收款|入金|credited|deposit/.test(raw);
+  const isExpenseLine = /借方|支出|出账|转出|付款|付出|debit|payment/.test(raw);
+
+  if (!income && !expense && normalizedAmounts.length >= 3) {
+    income = isExpenseLine ? "" : normalizedAmounts[0];
+    expense = isExpenseLine ? normalizedAmounts[0] : normalizedAmounts[1];
+    balance = balance || normalizedAmounts[2];
+  } else if (!income && !expense && normalizedAmounts.length === 2) {
+    if (isIncomeLine && !isExpenseLine) {
+      income = normalizedAmounts[0];
+      balance = balance || normalizedAmounts[1];
+    } else if (isExpenseLine && !isIncomeLine) {
+      expense = normalizedAmounts[0];
+      balance = balance || normalizedAmounts[1];
+    } else {
+      income = normalizedAmounts[0];
+      balance = balance || normalizedAmounts[1];
+    }
+  } else if (!income && !expense && normalizedAmounts.length === 1) {
+    const amount = normalizedAmounts[0];
+    if (/^-/.test(amount) || isExpenseLine) expense = amount.replace(/^-/, "");
+    else income = amount.replace(/^\+/, "");
+  }
+
+  if (!balance && normalizedAmounts.length > 0) {
+    balance = normalizedAmounts[normalizedAmounts.length - 1];
+  }
+
+  if (income && balance === income && normalizedAmounts.length === 1) {
+    balance = "";
+  }
+  if (expense && balance === expense && normalizedAmounts.length === 1) {
+    balance = "";
+  }
+
+  return {
+    income: income || "",
+    expense: expense || "",
+    balance: balance || "",
+  };
+}
+
+function extractCounterpartyFromFinancialLine(line) {
+  const raw = String(line || "");
+  const labeledPatterns = [
+    /(?:对方户名|对手方|交易对手|付款方|收款方|对方名称|户名|摘要说明)[:：]?\s*([^\s,，;；]{2,32})/,
+    /(?:付款人|收款人|对方账号名称)[:：]?\s*([^\s,，;；]{2,32})/,
+  ];
+  for (const pattern of labeledPatterns) {
+    const match = raw.match(pattern);
+    if (match?.[1]) return normalizeFinancialCell(match[1]);
+  }
+
+  const stripped = raw
+    .replace(/(?:\b\d{4}[-/.年]?\d{2}[-/.月]?\d{2}(?:日)?\b|\b20[1-2]\d{5}\b)/g, " ")
+    .replace(/[+-]?\d{1,3}(?:,\d{3})*(?:\.\d{2})|[+-]?\d+\.\d{2}/g, " ")
+    .replace(/(?:余额|借方|贷方|收入|支出|转入|转出|摘要|备注|币种|人民币|本币|账号|卡号|交易地点|渠道|柜台|网银|手机银行)/g, " ");
+  const tokens = stripped
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .filter((token) => /[\u4e00-\u9fa5a-zA-Z]/.test(token))
+    .filter((token) => !/^(摘要|备注|交易|银行|账户|账号|卡号)$/.test(token))
+    .sort((a, b) => b.length - a.length);
+  return tokens[0] ? normalizeFinancialCell(tokens[0]).slice(0, 32) : "";
+}
+
+function extractSummaryFromFinancialLine(line, date, amount, counterparty) {
+  const raw = String(line || "");
+  const explicitMatch = raw.match(/(?:摘要|备注|附言|用途|说明)[:：]?\s*(.+)$/);
+  if (explicitMatch?.[1]) {
+    return normalizeFinancialCell(explicitMatch[1]).slice(0, 80);
+  }
+
+  let summary = raw;
+  if (date) summary = summary.replace(date, " ");
+  if (counterparty) summary = summary.replace(counterparty, " ");
+  if (amount) summary = summary.replace(amount, " ");
+  summary = summary
+    .replace(/[|｜]/g, " ")
+    .replace(/(?:余额|借方|贷方|收入|支出|转入|转出|摘要|备注|附言|用途|说明|币种|人民币|本币|账号|卡号|对方户名|对手方)/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return summary.slice(0, 80);
+}
+
+function buildStructuredFinancialRows(cleanedText) {
+  const lines = String(cleanedText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const rows = [];
+  for (const rawLine of lines) {
+    const date = extractDateFromFinancialLine(rawLine);
+    if (!date) continue;
+    const amountColumns = splitFinancialAmounts(rawLine);
+    const counterparty = extractCounterpartyFromFinancialLine(rawLine);
+    const summary = extractSummaryFromFinancialLine(
+      rawLine,
+      date,
+      amountColumns.income || amountColumns.expense || amountColumns.balance,
+      counterparty
+    );
+    rows.push({
+      date,
+      income: amountColumns.income,
+      expense: amountColumns.expense,
+      balance: amountColumns.balance,
+      counterparty,
+      summary,
+      raw: normalizeFinancialCell(rawLine).slice(0, 220),
+    });
+  }
+  return rows;
+}
+
+function buildFinancialChunkSummaries(rows) {
+  const chunkSize = Math.max(40, FINANCIAL_SUMMARY_CHUNK_SIZE);
+  const chunks = [];
+  for (let i = 0; i < rows.length; i += chunkSize) {
+    const chunkRows = rows.slice(i, i + chunkSize);
+    if (chunkRows.length === 0) continue;
+
+    const counterparties = new Map();
+    for (const row of chunkRows) {
+      const key = String(row.counterparty || "未识别对手方").trim();
+      counterparties.set(key, (counterparties.get(key) || 0) + 1);
+    }
+    const topCounterparties = [...counterparties.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([name, count]) => `${name}(${count})`)
+      .join("、");
+
+    const representative = chunkRows
+      .slice(0, 3)
+      .map((row) =>
+        `${row.date} | 收入:${row.income || "-"} | 支出:${row.expense || "-"} | 余额:${row.balance || "-"} | ${row.counterparty || "对手方待识别"} | ${row.summary || row.raw}`
+      )
+      .join("\n");
+
+    chunks.push(
+      [
+        `分段 ${chunks.length + 1}`,
+        `时间范围：${chunkRows[0].date} 至 ${chunkRows[chunkRows.length - 1].date}`,
+        `交易条数：${chunkRows.length}`,
+        `高频对手方：${topCounterparties || "未识别"}`,
+        `代表性节点：`,
+        representative,
+      ].join("\n")
+    );
+  }
+  return chunks;
+}
+
+function buildFinancialDataPayload({ rawText, attachmentName }) {
+  const cleaned = cleanFinancialPdfText(rawText);
+  let cleanedText = String(cleaned.text || "").trim();
+  let truncated = false;
+
+  if (cleanedText.length > FINANCIAL_DATA_MAX_CHARS) {
+    cleanedText = cleanedText.slice(0, FINANCIAL_DATA_MAX_CHARS);
+    truncated = true;
+  }
+
+  if (!cleanedText) {
+    let fallbackText = String(rawText || "").replace(/\s+\n/g, "\n").trim();
+    if (fallbackText.length > FINANCIAL_DATA_MAX_CHARS) {
+      fallbackText = fallbackText.slice(0, FINANCIAL_DATA_MAX_CHARS);
+      truncated = true;
+    }
+    cleanedText = fallbackText;
+  }
+
+  if (!cleanedText) {
+    return {
+      text: "",
+      truncated,
+      lineCount: cleaned.lineCount,
+      originalLineCount: cleaned.originalLineCount,
+      structuredRowCount: 0,
+      usedChunkSummary: false,
+    };
+  }
+
+  const rows = buildStructuredFinancialRows(cleanedText);
+  const structuredLines = rows.map((row) =>
+    `${row.date || "日期待识别"} | ${row.income || "-"} | ${row.expense || "-"} | ${row.balance || "-"} | ${row.counterparty || "对手方待识别"} | ${row.summary || "摘要待识别"}`
+  );
+  let usedChunkSummary = false;
+  let structuredBlock = structuredLines.join("\n");
+  let chunkSummaryText = "";
+
+  if (structuredBlock.length > FINANCIAL_SUMMARY_TRIGGER_CHARS) {
+    usedChunkSummary = true;
+    chunkSummaryText = buildFinancialChunkSummaries(rows).join("\n\n");
+    structuredBlock = structuredLines.slice(0, Math.max(20, FINANCIAL_DETAIL_KEEP_ROWS)).join("\n");
+  }
+
+  const noteParts = [
+    `来源附件：${attachmentName || "PDF附件"}`,
+    `保留交易行数：${cleaned.lineCount}`,
+    `原始行数：${cleaned.originalLineCount}`,
+    `结构化条数：${rows.length}`,
+    usedChunkSummary ? `分段摘要：已启用（每 ${FINANCIAL_SUMMARY_CHUNK_SIZE} 条一段）` : "分段摘要：未启用",
+    truncated ? `状态：已按 ${FINANCIAL_DATA_MAX_CHARS} 字符安全截断` : "状态：未截断",
+  ];
+
+  const payloadSections = [
+    `<financial_data>`,
+    noteParts.join(" | "),
+    "",
+  ];
+
+  if (chunkSummaryText) {
+    payloadSections.push("<chunk_summaries>");
+    payloadSections.push(chunkSummaryText);
+    payloadSections.push("</chunk_summaries>");
+    payloadSections.push("");
+  }
+
+  if (structuredBlock) {
+    payloadSections.push("<structured_transactions>");
+    payloadSections.push("日期 | 收入 | 支出 | 余额 | 对手方 | 摘要");
+    payloadSections.push(structuredBlock);
+    payloadSections.push("</structured_transactions>");
+    payloadSections.push("");
+  }
+
+  if (!chunkSummaryText) {
+    payloadSections.push("<raw_transaction_lines>");
+    payloadSections.push(cleanedText);
+    payloadSections.push("</raw_transaction_lines>");
+    payloadSections.push("");
+  }
+
+  payloadSections.push("</financial_data>");
+
+  let finalText = payloadSections.join("\n").trim();
+  if (finalText.length > FINANCIAL_DATA_MAX_CHARS) {
+    finalText = finalText.slice(0, FINANCIAL_DATA_MAX_CHARS);
+    truncated = true;
+  }
+
+  return {
+    text: finalText,
+    truncated,
+    lineCount: cleaned.lineCount,
+    originalLineCount: cleaned.originalLineCount,
+    structuredRowCount: rows.length,
+    usedChunkSummary,
+  };
+}
+
 async function uploadBinaryFileToGemini({ filePath, mimeType, displayName }) {
   const uploadedFile = await ai.files.upload({
     file: filePath,
@@ -677,6 +1024,9 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
     expiresAt: Date.now() + UPLOAD_ATTACHMENT_TTL_MS,
     kind: "text",
     text: "",
+    textLimit: TEXT_EXTRACT_MAX_CHARS,
+    isFinancialData: false,
+    usedChunkSummary: false,
     fileUri: "",
     data: "",
     geminiFileName: "",
@@ -687,6 +1037,7 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
       const text = await readUtf8TextLimited(file.path, TEXT_EXTRACT_MAX_CHARS);
       record.kind = "text";
       record.text = text.slice(0, TEXT_EXTRACT_MAX_CHARS);
+      record.textLimit = TEXT_EXTRACT_MAX_CHARS;
       return record;
     }
 
@@ -695,6 +1046,7 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
       record.kind = "text";
       record.mimeType = "text/plain";
       record.text = String(text || "").slice(0, TEXT_EXTRACT_MAX_CHARS);
+      record.textLimit = TEXT_EXTRACT_MAX_CHARS;
       return record;
     }
 
@@ -703,7 +1055,44 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
       record.kind = "text";
       record.mimeType = "text/plain";
       record.text = String(text || "").slice(0, TEXT_EXTRACT_MAX_CHARS);
+      record.textLimit = TEXT_EXTRACT_MAX_CHARS;
       return record;
+    }
+
+    if (mimeType === "application/pdf") {
+      const shouldPreferTextPath = Number(file?.size || 0) >= LARGE_PDF_PARSE_THRESHOLD_BYTES;
+      try {
+        const pdfText = await parsePdfToText(file.path);
+        if (pdfText) {
+          if (looksLikeFinancialPdf(name, pdfText)) {
+            const financialPayload = buildFinancialDataPayload({
+              rawText: pdfText,
+              attachmentName: name,
+            });
+            if (financialPayload.text) {
+              record.kind = "text";
+              record.mimeType = "text/plain";
+              record.text = financialPayload.text;
+              record.textLimit = FINANCIAL_DATA_MAX_CHARS;
+              record.isFinancialData = true;
+              record.usedChunkSummary = Boolean(financialPayload.usedChunkSummary);
+              return record;
+            }
+          }
+
+          if (shouldPreferTextPath) {
+            record.kind = "text";
+            record.mimeType = "text/plain";
+            record.text = pdfText.slice(0, TEXT_EXTRACT_MAX_CHARS);
+            record.textLimit = TEXT_EXTRACT_MAX_CHARS;
+            return record;
+          }
+        }
+      } catch (pdfParseError) {
+        if (shouldPreferTextPath) {
+          throw new Error(`PDF 解析失败，无法进入轻量清洗链路：${normalizeErrorMessage(pdfParseError)}`);
+        }
+      }
     }
 
     if (PDF_IMAGE_MIME_TYPES.has(mimeType)) {
@@ -726,6 +1115,7 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId }) 
               record.kind = "text";
               record.mimeType = "text/plain";
               record.text = pdfText.slice(0, TEXT_EXTRACT_MAX_CHARS);
+              record.textLimit = TEXT_EXTRACT_MAX_CHARS;
               return record;
             }
           } catch {
@@ -816,11 +1206,21 @@ function normalizeAttachmentIds(rawIds) {
 function mapUploadedRecordToAttachment(record) {
   if (!record) return null;
   if (record.kind === "text") {
+    const textLimit = Math.max(
+      1,
+      Math.min(
+        FINANCIAL_DATA_MAX_CHARS,
+        Number(record.textLimit) > 0 ? Number(record.textLimit) : TEXT_EXTRACT_MAX_CHARS
+      )
+    );
     return {
       kind: "text",
       name: record.name,
       mimeType: record.mimeType || "text/plain",
-      text: String(record.text || "").slice(0, TEXT_EXTRACT_MAX_CHARS),
+      text: String(record.text || "").slice(0, textLimit),
+      textLimit,
+      isFinancialData: Boolean(record.isFinancialData),
+      usedChunkSummary: Boolean(record.usedChunkSummary),
     };
   }
   return {
@@ -1462,7 +1862,13 @@ function normalizeAttachments(rawAttachments) {
         kind: "text",
         name,
         mimeType: mimeType || "text/plain",
-        text: text.slice(0, MAX_TEXT_ATTACHMENT_CHARS),
+        text: text.slice(0, FINANCIAL_DATA_MAX_CHARS),
+        textLimit: Math.min(
+          FINANCIAL_DATA_MAX_CHARS,
+          Number(item.textLimit) > 0 ? Number(item.textLimit) : MAX_TEXT_ATTACHMENT_CHARS
+        ),
+        isFinancialData: Boolean(item.isFinancialData) || /<financial_data>/i.test(text),
+        usedChunkSummary: Boolean(item.usedChunkSummary) || /<chunk_summaries>/i.test(text),
       });
       continue;
     }
@@ -1502,6 +1908,7 @@ function shouldUseForensicFinanceMode(userMessage, attachments) {
   if (inQuestion) return true;
 
   for (const item of attachments || []) {
+    if (item?.isFinancialData) return true;
     if (!item || item.kind !== "text") continue;
     const text = String(item.text || "").slice(0, 5000).toLowerCase();
     if (FORENSIC_FINANCE_KEYWORDS.some((keyword) => text.includes(String(keyword).toLowerCase()))) {
@@ -1552,7 +1959,22 @@ function buildUserParts(userMessage, attachments, extraGuidance = "") {
 
     if (attachment.kind === "text") {
       parts.push({ text: `${title}（${attachment.mimeType}）` });
-      parts.push({ text: attachment.text });
+      if (attachment.isFinancialData) {
+        parts.push({
+          text: attachment.usedChunkSummary
+            ? `以下为已清洗并分段摘要的交易流水数据，已提炼为结构化字段与分段摘要，用于降低大文件 Token 消耗并提高资金分析精度。`
+            : `以下为已清洗的交易流水数据，仅保留关键交易行并结构化为日期、金额、对手方、摘要四列，用于降低大文件 Token 消耗并提高资金分析精度。`,
+        });
+      }
+      parts.push({
+        text: String(attachment.text || "").slice(
+          0,
+          Math.min(
+            FINANCIAL_DATA_MAX_CHARS,
+            Number(attachment.textLimit) > 0 ? Number(attachment.textLimit) : TEXT_EXTRACT_MAX_CHARS
+          )
+        ),
+      });
       continue;
     }
 
@@ -1793,7 +2215,8 @@ function buildFinalPassContents({ contents, strategyText, searchQueries }) {
   ];
 }
 
-function shouldUsePlanAndSolvePipeline({ webSearch, timeoutMs }) {
+function shouldUsePlanAndSolvePipeline({ webSearch, timeoutMs, disablePlanAndSolve }) {
+  if (disablePlanAndSolve) return false;
   return Boolean(webSearch) || Number(timeoutMs) >= COMPLEX_QUESTION_MIN_TIMEOUT_MS;
 }
 
@@ -1845,10 +2268,10 @@ async function runTwoPassPlanAndSolve({ model, contents, timeoutMs, userMessage 
   };
 }
 
-async function generateReplyWithRetry({ model, contents, webSearch, timeoutMs, userMessage }) {
+async function generateReplyWithRetry({ model, contents, webSearch, timeoutMs, userMessage, disablePlanAndSolve = false }) {
   let lastError = null;
   const maxAttempts = 3;
-  const usePlanAndSolve = shouldUsePlanAndSolvePipeline({ webSearch, timeoutMs });
+  const usePlanAndSolve = shouldUsePlanAndSolvePipeline({ webSearch, timeoutMs, disablePlanAndSolve });
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       if (usePlanAndSolve) {
@@ -1965,6 +2388,7 @@ async function handleChat(req, res) {
       webSearch: useWebSearch,
       timeoutMs,
       userMessage,
+      disablePlanAndSolve: forensicFinanceMode,
     });
 
     console.log(
