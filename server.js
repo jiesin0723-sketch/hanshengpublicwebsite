@@ -229,6 +229,7 @@ const UPLOAD_ATTACHMENT_TTL_MS = readPositiveInt("UPLOAD_ATTACHMENT_TTL_MS", 24 
 const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000);
 const LARGE_PDF_PARSE_THRESHOLD_BYTES = readPositiveInt("LARGE_PDF_PARSE_THRESHOLD_BYTES", 8 * 1024 * 1024);
 const OCR_PDF_MIN_TEXT_CHARS = readPositiveInt("OCR_PDF_MIN_TEXT_CHARS", 200);
+const ASYNC_ATTACHMENT_CONTEXT_CHARS = readPositiveInt("ASYNC_ATTACHMENT_CONTEXT_CHARS", 120_000);
 const DOCMIND_HTTP_TIMEOUT_MS = readPositiveInt("DOCMIND_HTTP_TIMEOUT_MS", 120_000);
 const DOCMIND_POLL_INTERVAL_MS = readPositiveInt("DOCMIND_POLL_INTERVAL_MS", 3_000);
 const DOCMIND_POLL_TIMEOUT_MS = readPositiveInt("DOCMIND_POLL_TIMEOUT_MS", 3 * 60 * 1000);
@@ -479,6 +480,7 @@ const ai = new GoogleGenAI({
 const sessions = new Map();
 const conversationContexts = new Map();
 const uploadedAttachments = new Map();
+const attachmentMaterializationTasks = new Map();
 const conversationProgress = new Map();
 const UPLOAD_TMP_DIR = path.join(__dirname, ".upload-tmp");
 fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
@@ -1489,6 +1491,12 @@ function createDeferredUploadedAttachmentRecord({
     textLimit: TEXT_EXTRACT_MAX_CHARS,
     isFinancialData: false,
     usedChunkSummary: false,
+    parseStatus: "pending",
+    parseMessage: "AI后台识别排队中",
+    parseError: "",
+    parseStartedAt: 0,
+    parseFinishedAt: 0,
+    contextInjected: false,
   };
 }
 
@@ -1672,6 +1680,7 @@ async function deleteGeminiFileByName(geminiFileName) {
 async function removeUploadedAttachmentRecord(record, { deleteRemote = true } = {}) {
   if (!record) return false;
   uploadedAttachments.delete(record.id);
+  attachmentMaterializationTasks.delete(record.id);
   if (deleteRemote && record.kind === "binary") {
     await deleteGeminiFileByName(record.geminiFileName);
   }
@@ -1817,6 +1826,75 @@ async function materializeUploadedAttachments(records, progressReporter = null) 
     output.push(await materializeUploadedAttachmentRecord(record, progressReporter));
   }
   return output;
+}
+
+function appendBackgroundAttachmentContext(record) {
+  if (!record || record.contextInjected || record.kind !== "text") return;
+  const rawText = String(record.text || "").trim();
+  if (!rawText) return;
+  const contextText = rawText.slice(0, Math.min(ASYNC_ATTACHMENT_CONTEXT_CHARS, Number(record.textLimit) > 0 ? Number(record.textLimit) : TEXT_EXTRACT_MAX_CHARS));
+  if (!contextText) return;
+  const context = getConversationContext(record.userId, record.conversationId);
+  appendContextMessage(context, "user", [{
+    text: `【已完成后台案卷识别：${record.name}】\n以下为案卷识别内容，请在后续问答中作为既有事实基础继续分析：\n${contextText}`,
+  }]);
+  record.contextInjected = true;
+  record.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+  uploadedAttachments.set(record.id, record);
+}
+
+function scheduleAttachmentMaterialization(record) {
+  if (!record || record.kind !== "remote") return;
+  const current = uploadedAttachments.get(record.id) || record;
+  if (attachmentMaterializationTasks.has(current.id)) return;
+  if (current.kind !== "remote") return;
+  if (current.parseStatus === "processing") return;
+
+  current.parseStatus = "processing";
+  current.parseMessage = "AI后台深度识别中";
+  current.parseError = "";
+  current.parseStartedAt = Date.now();
+  current.parseFinishedAt = 0;
+  current.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+  uploadedAttachments.set(current.id, current);
+
+  const task = (async () => {
+    try {
+      const materialized = await materializeUploadedAttachmentRecord(current, null);
+      if (!uploadedAttachments.has(current.id)) {
+        return;
+      }
+      materialized.parseStatus = "ready";
+      materialized.parseMessage = "后台识别完成";
+      materialized.parseError = "";
+      materialized.parseFinishedAt = Date.now();
+      materialized.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+      uploadedAttachments.set(materialized.id, materialized);
+      appendBackgroundAttachmentContext(materialized);
+    } catch (error) {
+      const latest = uploadedAttachments.get(current.id) || current;
+      if (!uploadedAttachments.has(current.id)) {
+        return;
+      }
+      latest.parseStatus = "failed";
+      latest.parseMessage = "后台识别失败";
+      latest.parseError = normalizeErrorMessage(error);
+      latest.parseFinishedAt = Date.now();
+      latest.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+      uploadedAttachments.set(latest.id, latest);
+      console.error(
+        "后台案卷识别失败:",
+        `user=${latest.userId}`,
+        `conversation=${latest.conversationId}`,
+        `attachment=${latest.id}`,
+        latest.parseError
+      );
+    } finally {
+      attachmentMaterializationTasks.delete(current.id);
+    }
+  })();
+
+  attachmentMaterializationTasks.set(current.id, task);
 }
 
 function uploadSingleFileMiddleware(req, res, next) {
@@ -2020,10 +2098,12 @@ async function handleUploadComplete(req, res) {
       size: expectedSize,
     });
     uploadedAttachments.set(record.id, record);
+    scheduleAttachmentMaterialization(record);
 
     return res.json({
       status: "success",
       success: true,
+      message: "案卷已接收，AI 正在后台深度识别中，请稍候提问...",
       url: signedUrl,
       attachment: {
         id: record.id,
@@ -2933,30 +3013,38 @@ async function handleChat(req, res) {
       attachmentIds,
     });
     if (uploaded.missing.length > 0) {
+      clearConversationProgress(req.authUser.id, conversationId);
       return res.status(400).json({
         success: false,
         message: "部分附件不存在、已过期，或不属于当前会话，请重新上传后再试",
         missingAttachmentIds: uploaded.missing,
       });
     }
-    try {
-      const materializedRecords = await materializeUploadedAttachments(uploaded.resolved, updateProgress);
-      attachments = materializedRecords.map(mapUploadedRecordToAttachment).filter(Boolean);
-    } catch (attachmentError) {
-      const errorCode = String(attachmentError?.code || "");
-      const detail = normalizeErrorMessage(attachmentError);
-      const ocrFailed = errorCode === "SCANNED_PDF_OCR_FAILED";
+
+    const remoteRecords = uploaded.resolved.filter((record) => record?.kind === "remote");
+    if (remoteRecords.length > 0) {
+      remoteRecords.forEach((record) => scheduleAttachmentMaterialization(record));
+      const failedRecord = remoteRecords.find((record) => String(record?.parseStatus || "").toLowerCase() === "failed");
+      if (failedRecord) {
+        clearConversationProgress(req.authUser.id, conversationId);
+        return res.status(502).json({
+          status: "error",
+          success: false,
+          errorCode: "ATTACHMENT_PROCESSING_FAILED",
+          message: "读取云端案卷失败，请重试或截取关键页上传",
+          error: String(failedRecord.parseError || failedRecord.parseMessage || "background parsing failed"),
+        });
+      }
       clearConversationProgress(req.authUser.id, conversationId);
-      return res.status(ocrFailed ? 502 : 500).json({
+      return res.status(425).json({
         status: "error",
         success: false,
-        errorCode: ocrFailed ? "SCANNED_PDF_OCR_FAILED" : "ATTACHMENT_PROCESSING_FAILED",
-        message: ocrFailed
-          ? "读取云端案卷失败，请重试或截取关键页上传"
-          : "附件处理失败，请稍后重试。",
-        error: detail,
+        errorCode: "ATTACHMENT_PARSING_IN_PROGRESS",
+        message: "案卷过大，AI 仍在深度阅卷中，请耐心等待 1-2 分钟后再试。",
       });
     }
+
+    attachments = uploaded.resolved.map(mapUploadedRecordToAttachment).filter((item) => item && item.kind !== "remote");
   }
   const requestedModel = req.body?.model;
   const modelResult = resolveRequestModel(requestedModel);
