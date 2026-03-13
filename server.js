@@ -870,6 +870,48 @@ function extractTextFromDocMindData(data) {
   return output.join("\n").trim();
 }
 
+function extractDocMindFailureReason(body) {
+  const reasons = [];
+  const push = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return;
+    if (!reasons.includes(text)) reasons.push(text);
+  };
+
+  push(body?.message);
+  const data = body?.data;
+  if (data && typeof data === "object") {
+    for (const key of ["reason", "failReason", "error", "errorMessage", "message", "detail", "details"]) {
+      push(data[key]);
+    }
+  }
+
+  if (reasons.length > 0) {
+    return reasons.join(" | ");
+  }
+  try {
+    return JSON.stringify(body || {});
+  } catch {
+    return String(body || "");
+  }
+}
+
+function logDocMindRawError(label, error) {
+  const raw = error && typeof error === "object" ? error : { value: error };
+  const props = {};
+  if (raw && typeof raw === "object") {
+    for (const key of Object.getOwnPropertyNames(raw)) {
+      props[key] = raw[key];
+    }
+  }
+  console.error(`${label} message:`, String(error?.message || error || ""));
+  console.error(`${label} stack:`, String(error?.stack || ""));
+  console.error(`${label} props:`, props);
+  if (error?.cause) {
+    console.error(`${label} cause:`, error.cause);
+  }
+}
+
 async function submitDocMindStructureJob({ signedUrl, fileName }) {
   const client = getAliyunDocMindClient();
   const safeFileName = normalizeFilename(fileName || "document.pdf", "document.pdf");
@@ -924,10 +966,13 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
       throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
     }
     if (["failed", "error", "aborted", "cancelled", "canceled"].includes(status)) {
+      const failReason = extractDocMindFailureReason(response?.body || {});
+      console.error("[DocMind失败原因]:", failReason);
+      console.error("[DocMind失败响应体]:", response?.body || {});
       throw createTaggedError(
         "SCANNED_PDF_OCR_FAILED",
         "读取云端案卷失败，请重试或截取关键页上传",
-        String(response?.body?.message || status || "DocMind job failed"),
+        String(failReason || status || "DocMind job failed"),
         502
       );
     }
@@ -1016,8 +1061,7 @@ async function extractTextWithFallback(filePath, fileUrl = "", progressReporter 
       extractor: "aliyun-docmind-async",
     };
   } catch (error) {
-    const rawMessage = String(error?.message || error || "");
-    console.error("[DocMind完整错误]:", rawMessage);
+    logDocMindRawError("[DocMind完整错误]", error);
     const detail = normalizeErrorMessage(error);
     if (/unexpected token\s*['"]?</i.test(detail) || detail.includes("<?xml")) {
       console.error("[阿里云真实拦截原因]:", detail);
