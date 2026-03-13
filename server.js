@@ -17,6 +17,7 @@ const { once } = require("events");
 const { GoogleGenAI } = require("@google/genai");
 
 const app = express();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function readPositiveInt(name, fallback) {
   const value = Number(process.env[name]);
@@ -945,16 +946,31 @@ async function submitDocMindStructureJob({ signedUrl, fileName }) {
 async function pollDocMindStructureResult(jobId, progressReporter = null) {
   const client = getAliyunDocMindClient();
   const maxAttempts = Math.max(1, DOCMIND_POLL_MAX_ATTEMPTS);
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  let attempt = 0;
+  while (attempt < maxAttempts) {
+    attempt += 1;
     const request = new AlibabaCloudDocMind.GetDocStructureResultRequest({
       id: jobId,
       revealMarkdown: true,
       useUrlResponseBody: false,
     });
-    const response = await withTimeout(
-      runDocMindWithRetry("get-doc-structure-result", () => client.getDocStructureResult(request)),
-      DOCMIND_HTTP_TIMEOUT_MS
-    );
+    let response = null;
+    try {
+      response = await withTimeout(
+        runDocMindWithRetry("get-doc-structure-result", () => client.getDocStructureResult(request)),
+        DOCMIND_HTTP_TIMEOUT_MS
+      );
+    } catch (error) {
+      const raw = normalizeErrorMessage(error).toLowerCase();
+      const code = String(error?.code || "").toLowerCase();
+      const networkFlaky = isNetworkError(error) || code === "econnreset" || raw.includes("aborted");
+      if (networkFlaky) {
+        console.warn(`[DocMind轮询网络抖动] attempt=${attempt}/${maxAttempts} code=${String(error?.code || "")} message=${String(error?.message || "")}`);
+        await sleep(DOCMIND_POLL_INTERVAL_MS);
+        continue;
+      }
+      throw error;
+    }
     const body = response?.body || {};
     const responseCode = String(body?.code || "").trim();
     const statusRaw = String(body?.status || "").trim();
@@ -995,7 +1011,7 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
       if (typeof progressReporter === "function") {
         progressReporter("ocr", `正在识别扫描件文字（任务处理中，第${attempt}/${maxAttempts}次轮询）`);
       }
-      await new Promise((resolve) => setTimeout(resolve, DOCMIND_POLL_INTERVAL_MS));
+      await sleep(DOCMIND_POLL_INTERVAL_MS);
       continue;
     }
 
@@ -1006,7 +1022,7 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
     if (typeof progressReporter === "function") {
       progressReporter("ocr", `正在识别扫描件文字（任务处理中，第${attempt}/${maxAttempts}次轮询）`);
     }
-    await new Promise((resolve) => setTimeout(resolve, DOCMIND_POLL_INTERVAL_MS));
+    await sleep(DOCMIND_POLL_INTERVAL_MS);
   }
 
   const timeoutMs = maxAttempts * DOCMIND_POLL_INTERVAL_MS;
