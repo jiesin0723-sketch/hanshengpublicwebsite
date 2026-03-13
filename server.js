@@ -914,33 +914,6 @@ function parseStructuredOcrDataString(dataString) {
   };
 }
 
-function buildOcrInputSource({ filePath = "", fileUrl = "" } = {}) {
-  const normalizedPath = String(filePath || "").trim();
-  if (normalizedPath) {
-    return {
-      requestSource: {
-        body: fs.createReadStream(normalizedPath),
-      },
-      sourceMode: "body",
-    };
-  }
-  const normalizedUrl = String(fileUrl || "").trim();
-  if (normalizedUrl) {
-    return {
-      requestSource: {
-        url: normalizedUrl,
-      },
-      sourceMode: "url",
-    };
-  }
-  throw createTaggedError(
-    "SCANNED_PDF_OCR_FAILED",
-    "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
-    "missing OCR input source",
-    400
-  );
-}
-
 function createAliyunOcrResponseError(responseCode, detail) {
   const numericStatus = Number(responseCode);
   const statusCode = Number.isFinite(numericStatus) && numericStatus >= 400 && numericStatus < 600
@@ -954,12 +927,61 @@ function createAliyunOcrResponseError(responseCode, detail) {
   );
 }
 
-async function recognizeDocumentStructureWithAliyun({ filePath = "", fileUrl = "" } = {}) {
+async function probeSignedUrlForOcr(fileUrl) {
+  const url = String(fileUrl || "").trim();
+  if (!url) {
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "读取云端案卷失败，请重试或截取关键页上传",
+      "missing signed file url",
+      400
+    );
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.min(30_000, OCR_TIMEOUT_MS));
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-1023" },
+      signal: controller.signal,
+    });
+    const ok = response.status === 200 || response.status === 206;
+    if (!ok) {
+      const text = await response.text().catch(() => "");
+      console.error("[阿里云真实拦截原因]:", String(text || "").slice(0, 4_000));
+      throw createTaggedError(
+        "SCANNED_PDF_OCR_FAILED",
+        "读取云端案卷失败，请重试或截取关键页上传",
+        `signed-url-http-${response.status}`,
+        502
+      );
+    }
+    if (response.body && typeof response.body.cancel === "function") {
+      response.body.cancel().catch(() => {});
+    }
+  } catch (error) {
+    if (String(error?.code || "") === "SCANNED_PDF_OCR_FAILED") throw error;
+    const detail = normalizeErrorMessage(error);
+    if (/unexpected token\s*['"]?</i.test(detail) || detail.includes("<?xml")) {
+      console.error("[阿里云真实拦截原因]:", detail);
+    }
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "读取云端案卷失败，请重试或截取关键页上传",
+      detail,
+      502
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function recognizeDocumentStructureWithAliyun(fileUrl) {
   const client = getAliyunOcrClient();
-  const { requestSource, sourceMode } = buildOcrInputSource({ filePath, fileUrl });
-  console.log(`[审计] OCR调用: document-structure mode=${sourceMode}`);
+  console.log("[审计] OCR调用: document-structure mode=url");
   const request = new AlibabaCloudOcr.RecognizeDocumentStructureRequest({
-    ...requestSource,
+    url: String(fileUrl || "").trim(),
     needSortPage: true,
     outputTable: true,
     page: true,
@@ -975,12 +997,11 @@ async function recognizeDocumentStructureWithAliyun({ filePath = "", fileUrl = "
   return parseStructuredOcrDataString(response?.body?.data || "");
 }
 
-async function recognizeAllTextTableWithAliyun({ filePath = "", fileUrl = "" } = {}) {
+async function recognizeAllTextTableWithAliyun(fileUrl) {
   const client = getAliyunOcrClient();
-  const { requestSource, sourceMode } = buildOcrInputSource({ filePath, fileUrl });
-  console.log(`[审计] OCR调用: all-text-table mode=${sourceMode}`);
+  console.log("[审计] OCR调用: all-text-table mode=url");
   const request = new AlibabaCloudOcr.RecognizeAllTextRequest({
-    ...requestSource,
+    url: String(fileUrl || "").trim(),
     type: "Advanced",
     outputCoordinate: "true",
     tableConfig: new AlibabaCloudOcr.RecognizeAllTextRequestTableConfig({
@@ -1048,9 +1069,9 @@ async function runAliyunOcrWithRetry(label, task) {
   throw lastError || new Error(`OCR ${label} failed`);
 }
 
-async function recognizePdfTextWithAliyunOcr({ filePath = "", fileUrl = "" } = {}) {
+async function recognizePdfTextWithAliyunOcr(fileUrl) {
   const primary = await runAliyunOcrWithRetry("document-structure", () =>
-    recognizeDocumentStructureWithAliyun({ filePath, fileUrl })
+    recognizeDocumentStructureWithAliyun(fileUrl)
   );
   const hasStructuredRows = Array.isArray(primary?.structuredLines) && primary.structuredLines.length > 0;
   if (hasStructuredRows) {
@@ -1058,7 +1079,7 @@ async function recognizePdfTextWithAliyunOcr({ filePath = "", fileUrl = "" } = {
   }
 
   const secondary = await runAliyunOcrWithRetry("all-text-table", () =>
-    recognizeAllTextTableWithAliyun({ filePath, fileUrl })
+    recognizeAllTextTableWithAliyun(fileUrl)
   );
   const merged = mergeStructuredOcrOutputs(primary, secondary);
   const finalText = merged.structuredLines.length > 0
@@ -1078,13 +1099,12 @@ async function recognizePdfTextWithAliyunOcr({ filePath = "", fileUrl = "" } = {
     .trim();
 }
 
-async function recognizePdfTextWithAliyunAdvanced({ filePath = "", fileUrl = "" } = {}) {
+async function recognizePdfTextWithAliyunAdvanced(fileUrl) {
   const response = await runAliyunOcrWithRetry("advanced", async () => {
     const client = getAliyunOcrClient();
-    const { requestSource, sourceMode } = buildOcrInputSource({ filePath, fileUrl });
-    console.log(`[审计] OCR调用: advanced mode=${sourceMode}`);
+    console.log("[审计] OCR调用: advanced mode=url");
     const request = new AlibabaCloudOcr.RecognizeAdvancedRequest({
-      ...requestSource,
+      url: String(fileUrl || "").trim(),
       needSortPage: true,
       paragraph: true,
       row: true,
@@ -1110,7 +1130,7 @@ async function recognizePdfTextWithAliyunAdvanced({ filePath = "", fileUrl = "" 
     .trim();
 }
 
-async function extractTextWithFallback(filePath, fileUrl = "", progressReporter = null) {
+async function extractTextWithFallback(filePath, fileUrl = "", progressReporter = null, sourceObjectKey = "") {
   let pdfParsedText = "";
   try {
     pdfParsedText = await parsePdfToText(filePath);
@@ -1129,10 +1149,25 @@ async function extractTextWithFallback(filePath, fileUrl = "", progressReporter 
     };
   }
 
-  if (!fileUrl) {
+  let signedFileUrl = String(fileUrl || "").trim();
+  const normalizedObjectKey = String(sourceObjectKey || "").trim().replace(/^\/+/, "");
+  if (normalizedObjectKey) {
+    try {
+      signedFileUrl = buildSignedOssReadUrl(normalizedObjectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
+    } catch (signError) {
+      throw createTaggedError(
+        "SCANNED_PDF_OCR_FAILED",
+        "读取云端案卷失败，请重试或截取关键页上传",
+        normalizeErrorMessage(signError),
+        502
+      );
+    }
+  }
+
+  if (!signedFileUrl) {
     throw createTaggedError(
       "SCANNED_PDF_OCR_FAILED",
-      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
+      "读取云端案卷失败，请重试或截取关键页上传",
       "missing OCR file URL",
       502
     );
@@ -1142,17 +1177,32 @@ async function extractTextWithFallback(filePath, fileUrl = "", progressReporter 
   if (typeof progressReporter === "function") {
     progressReporter("ocr", "正在识别扫描件文字");
   }
-  let ocrText = "";
+
   try {
-    ocrText = await recognizePdfTextWithAliyunOcr({ filePath, fileUrl });
+    await probeSignedUrlForOcr(signedFileUrl);
+    let ocrText = "";
+    try {
+      ocrText = await recognizePdfTextWithAliyunOcr(signedFileUrl);
+    } catch (error) {
+      console.warn("[审计] 文档结构化 OCR 未得到可用表格结果，将回退全文 OCR：", normalizeErrorMessage(error));
+      ocrText = await recognizePdfTextWithAliyunAdvanced(signedFileUrl);
+    }
+    return {
+      rawText: ocrText,
+      extractor: "aliyun-ocr-structured",
+    };
   } catch (error) {
-    console.warn("[审计] 文档结构化 OCR 未得到可用表格结果，将回退全文 OCR：", normalizeErrorMessage(error));
-    ocrText = await recognizePdfTextWithAliyunAdvanced({ filePath, fileUrl });
+    const detail = normalizeErrorMessage(error);
+    if (/unexpected token\s*['"]?</i.test(detail) || detail.includes("<?xml")) {
+      console.error("[阿里云真实拦截原因]:", detail);
+    }
+    throw createTaggedError(
+      "SCANNED_PDF_OCR_FAILED",
+      "读取云端案卷失败，请重试或截取关键页上传",
+      detail,
+      502
+    );
   }
-  return {
-    rawText: ocrText,
-    extractor: "aliyun-ocr-structured",
-  };
 }
 
 function looksLikeFinancialPdf(name, text) {
@@ -1548,7 +1598,14 @@ async function uploadBinaryFileToGemini({ filePath, mimeType, displayName }) {
   return { fileUri, geminiFileName };
 }
 
-async function createUploadedAttachmentRecord({ file, userId, conversationId, sourceFileUrl = "", progressReporter = null }) {
+async function createUploadedAttachmentRecord({
+  file,
+  userId,
+  conversationId,
+  sourceFileUrl = "",
+  sourceObjectKey = "",
+  progressReporter = null,
+}) {
   const name = normalizeFilename(file?.originalname, "附件");
   const mimeType = normalizeUploadMimeType(file?.mimetype, name);
   if (!mimeType) {
@@ -1604,7 +1661,7 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId, so
     if (mimeType === "application/pdf") {
       const shouldPreferTextPath = Number(file?.size || 0) >= LARGE_PDF_PARSE_THRESHOLD_BYTES;
       try {
-        const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter);
+        const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter, sourceObjectKey);
         const pdfText = extractedPdf.rawText;
         if (pdfText) {
           if (looksLikeFinancialPdf(name, pdfText)) {
@@ -1656,7 +1713,7 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId, so
         // PDF上传失败时，优先走文本解析兜底，避免用户上传即失败。
         if (mimeType === "application/pdf") {
           try {
-            const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter);
+            const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter, sourceObjectKey);
             const pdfText = extractedPdf.rawText;
             if (pdfText) {
               record.kind = "text";
@@ -1827,6 +1884,7 @@ async function materializeUploadedAttachmentRecord(record, progressReporter = nu
     userId: record.userId,
     conversationId: record.conversationId,
     sourceFileUrl: signedUrl,
+    sourceObjectKey: record.objectKey,
     progressReporter,
   });
   const materialized = {
@@ -1911,7 +1969,7 @@ async function handleUploadAttachment(req, res) {
       success: false,
       errorCode: ocrFailed ? "SCANNED_PDF_OCR_FAILED" : "",
       message: ocrFailed
-        ? "扫描件文字识别失败，请确认图片清晰度或稍后再试。"
+        ? "读取云端案卷失败，请重试或截取关键页上传"
         : badRequest
         ? "附件类型不受支持"
         : "附件解析或上传失败",
@@ -2984,7 +3042,7 @@ async function handleChat(req, res) {
         success: false,
         errorCode: ocrFailed ? "SCANNED_PDF_OCR_FAILED" : "ATTACHMENT_PROCESSING_FAILED",
         message: ocrFailed
-          ? "扫描件文字识别失败，请确认图片清晰度或稍后再试。"
+          ? "读取云端案卷失败，请重试或截取关键页上传"
           : "附件处理失败，请稍后重试。",
         error: detail,
       });
