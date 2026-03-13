@@ -230,6 +230,7 @@ const OCR_PDF_MIN_TEXT_CHARS = readPositiveInt("OCR_PDF_MIN_TEXT_CHARS", 200);
 const DOCMIND_HTTP_TIMEOUT_MS = readPositiveInt("DOCMIND_HTTP_TIMEOUT_MS", 120_000);
 const DOCMIND_POLL_INTERVAL_MS = readPositiveInt("DOCMIND_POLL_INTERVAL_MS", 3_000);
 const DOCMIND_POLL_TIMEOUT_MS = readPositiveInt("DOCMIND_POLL_TIMEOUT_MS", 3 * 60 * 1000);
+const DOCMIND_POLL_MAX_ATTEMPTS = readPositiveInt("DOCMIND_POLL_MAX_ATTEMPTS", 100);
 const OSS_ENABLED = readBool("OSS_ENABLED", true);
 const OSS_BUCKET = String(process.env.OSS_BUCKET || "").trim();
 const OSS_ENDPOINT = String(process.env.OSS_ENDPOINT || "").trim();
@@ -943,12 +944,8 @@ async function submitDocMindStructureJob({ signedUrl, fileName }) {
 
 async function pollDocMindStructureResult(jobId, progressReporter = null) {
   const client = getAliyunDocMindClient();
-  const startedAt = Date.now();
-  const deadline = startedAt + DOCMIND_POLL_TIMEOUT_MS;
-  let pollCount = 0;
-
-  while (Date.now() < deadline) {
-    pollCount += 1;
+  const maxAttempts = Math.max(1, DOCMIND_POLL_MAX_ATTEMPTS);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     const request = new AlibabaCloudDocMind.GetDocStructureResultRequest({
       id: jobId,
       revealMarkdown: true,
@@ -958,26 +955,19 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
       runDocMindWithRetry("get-doc-structure-result", () => client.getDocStructureResult(request)),
       DOCMIND_HTTP_TIMEOUT_MS
     );
-    const responseCode = String(response?.body?.code || "").trim();
-    const status = String(response?.body?.status || "").trim().toLowerCase();
-    const completed = Boolean(response?.body?.completed) || ["success", "succeed", "succeeded", "completed", "done", "finished"].includes(status);
+    const body = response?.body || {};
+    const responseCode = String(body?.code || "").trim();
+    const statusRaw = String(body?.status || "").trim();
+    const status = statusRaw.toLowerCase();
+    const messageRaw = String(body?.message || "").trim();
+    const isCompleted = status === "completed";
+    const isFailed = status === "failed";
+    const isProcessingState = status === "init" || status === "processing";
+    const isProcessingMessage = /document processing/i.test(messageRaw);
+    const shouldKeepWaiting = isProcessingState || isProcessingMessage;
 
-    if (responseCode && responseCode !== "200") {
-      throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
-    }
-    if (["failed", "error", "aborted", "cancelled", "canceled"].includes(status)) {
-      const failReason = extractDocMindFailureReason(response?.body || {});
-      console.error("[DocMind失败原因]:", failReason);
-      console.error("[DocMind失败响应体]:", response?.body || {});
-      throw createTaggedError(
-        "SCANNED_PDF_OCR_FAILED",
-        "读取云端案卷失败，请重试或截取关键页上传",
-        String(failReason || status || "DocMind job failed"),
-        502
-      );
-    }
-    if (completed) {
-      const text = extractTextFromDocMindData(response?.body?.data || {});
+    if (isCompleted) {
+      const text = extractTextFromDocMindData(body?.data || {});
       if (!text) {
         throw createTaggedError(
           "SCANNED_PDF_OCR_FAILED",
@@ -988,16 +978,42 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
       }
       return text;
     }
-    if (typeof progressReporter === "function") {
-      progressReporter("ocr", `正在识别扫描件文字（任务处理中，第${pollCount}次轮询）`);
+
+    if (isFailed) {
+      const failReason = extractDocMindFailureReason(body);
+      console.error("[DocMind失败原因]:", failReason);
+      console.error("[DocMind失败响应体]:", body);
+      throw createTaggedError(
+        "SCANNED_PDF_OCR_FAILED",
+        "读取云端案卷失败，请重试或截取关键页上传",
+        String(failReason || statusRaw || "DocMind job failed"),
+        502
+      );
     }
-    await delay(DOCMIND_POLL_INTERVAL_MS);
+
+    if (shouldKeepWaiting) {
+      if (typeof progressReporter === "function") {
+        progressReporter("ocr", `正在识别扫描件文字（任务处理中，第${attempt}/${maxAttempts}次轮询）`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, DOCMIND_POLL_INTERVAL_MS));
+      continue;
+    }
+
+    if (responseCode && responseCode !== "200") {
+      throw createAliyunOcrResponseError(responseCode, String(messageRaw || responseCode));
+    }
+
+    if (typeof progressReporter === "function") {
+      progressReporter("ocr", `正在识别扫描件文字（任务处理中，第${attempt}/${maxAttempts}次轮询）`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, DOCMIND_POLL_INTERVAL_MS));
   }
 
+  const timeoutMs = maxAttempts * DOCMIND_POLL_INTERVAL_MS;
   throw createTaggedError(
     "SCANNED_PDF_OCR_FAILED",
     "读取云端案卷失败，请重试或截取关键页上传",
-    `DocMind轮询超时（>${DOCMIND_POLL_TIMEOUT_MS}ms）`,
+    `DocMind轮询超时（>${timeoutMs}ms）`,
     504
   );
 }
