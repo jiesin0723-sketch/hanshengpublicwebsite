@@ -8,7 +8,7 @@ const path = require("path");
 const multer = require("multer");
 const OSS = require("ali-oss");
 const OpenApi = require("@alicloud/openapi-client");
-const AlibabaCloudOcr = require("@alicloud/ocr-api20210707");
+const AlibabaCloudDocMind = require("@alicloud/docmind-api20220711");
 const mammoth = require("mammoth");
 const XLSX = require("xlsx");
 const WordExtractor = require("word-extractor");
@@ -227,9 +227,9 @@ const UPLOAD_ATTACHMENT_TTL_MS = readPositiveInt("UPLOAD_ATTACHMENT_TTL_MS", 24 
 const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000);
 const LARGE_PDF_PARSE_THRESHOLD_BYTES = readPositiveInt("LARGE_PDF_PARSE_THRESHOLD_BYTES", 8 * 1024 * 1024);
 const OCR_PDF_MIN_TEXT_CHARS = readPositiveInt("OCR_PDF_MIN_TEXT_CHARS", 200);
-const OCR_TIMEOUT_MS = readPositiveInt("OCR_TIMEOUT_MS", 120_000);
-const OCR_NETWORK_RETRY_ATTEMPTS = readPositiveInt("OCR_NETWORK_RETRY_ATTEMPTS", 3);
-const OCR_NETWORK_RETRY_BASE_DELAY_MS = readPositiveInt("OCR_NETWORK_RETRY_BASE_DELAY_MS", 1_500);
+const DOCMIND_HTTP_TIMEOUT_MS = readPositiveInt("DOCMIND_HTTP_TIMEOUT_MS", 120_000);
+const DOCMIND_POLL_INTERVAL_MS = readPositiveInt("DOCMIND_POLL_INTERVAL_MS", 3_000);
+const DOCMIND_POLL_TIMEOUT_MS = readPositiveInt("DOCMIND_POLL_TIMEOUT_MS", 3 * 60 * 1000);
 const OSS_ENABLED = readBool("OSS_ENABLED", true);
 const OSS_BUCKET = String(process.env.OSS_BUCKET || "").trim();
 const OSS_ENDPOINT = String(process.env.OSS_ENDPOINT || "").trim();
@@ -240,8 +240,8 @@ const OSS_PRESIGN_EXPIRE_SECONDS = readPositiveInt("OSS_PRESIGN_EXPIRE_SECONDS",
 const OSS_FETCH_TIMEOUT_MS = readPositiveInt("OSS_FETCH_TIMEOUT_MS", 180_000);
 const OSS_FORCE_HTTPS = readBool("OSS_FORCE_HTTPS", true);
 const OSS_PUBLIC_BASE_URL = String(process.env.OSS_PUBLIC_BASE_URL || "").trim();
-const OCR_ENDPOINT = String(process.env.OCR_ENDPOINT || "ocr-api.cn-hangzhou.aliyuncs.com").trim();
-const OCR_REGION_ID = String(process.env.OCR_REGION_ID || "cn-hangzhou").trim();
+const DOCMIND_ENDPOINT = String(process.env.DOCMIND_ENDPOINT || process.env.OCR_ENDPOINT || "docmind-api.cn-hangzhou.aliyuncs.com").trim();
+const DOCMIND_REGION_ID = String(process.env.DOCMIND_REGION_ID || process.env.OCR_REGION_ID || "cn-hangzhou").trim();
 const OSS_SIGNED_URL_EXPIRE_SECONDS = readPositiveInt("OSS_SIGNED_URL_EXPIRE_SECONDS", 3600);
 const OSS_REGION = String(process.env.OSS_REGION || detectOssRegion()).trim();
 
@@ -693,7 +693,7 @@ function createTaggedError(code, message, detail = "", statusCode = 500) {
   return error;
 }
 
-let ocrClientInstance = null;
+let docMindClientInstance = null;
 let ossClientInstance = null;
 
 function getOssClient() {
@@ -719,199 +719,19 @@ function buildSignedOssReadUrl(objectKey, expires = OSS_SIGNED_URL_EXPIRE_SECOND
   });
 }
 
-function getAliyunOcrClient() {
-  if (ocrClientInstance) return ocrClientInstance;
+function getAliyunDocMindClient() {
+  if (docMindClientInstance) return docMindClientInstance;
   if (!OSS_ACCESS_KEY_ID || !OSS_ACCESS_KEY_SECRET) {
-    throw createTaggedError("OCR_NOT_CONFIGURED", "扫描件文字识别失败，请确认服务端 OCR 配置完整。", "", 500);
+    throw createTaggedError("DOCMIND_NOT_CONFIGURED", "扫描件文字识别失败，请确认服务端 OCR 配置完整。", "", 500);
   }
   const config = new OpenApi.Config({
     accessKeyId: OSS_ACCESS_KEY_ID,
     accessKeySecret: OSS_ACCESS_KEY_SECRET,
-    endpoint: OCR_ENDPOINT,
-    regionId: OCR_REGION_ID,
+    endpoint: DOCMIND_ENDPOINT,
+    regionId: DOCMIND_REGION_ID,
   });
-  ocrClientInstance = new AlibabaCloudOcr.default(config);
-  return ocrClientInstance;
-}
-
-function extractTextFromAliyunOcrPayload(payload) {
-  if (!payload) return "";
-  if (typeof payload === "string") {
-    try {
-      return extractTextFromAliyunOcrPayload(JSON.parse(payload));
-    } catch {
-      return payload.trim();
-    }
-  }
-  if (typeof payload !== "object") return "";
-
-  const content = String(payload.content || payload.Content || "").trim();
-  if (content) return content;
-
-  if (Array.isArray(payload.prism_wordsInfo) && payload.prism_wordsInfo.length > 0) {
-    return payload.prism_wordsInfo
-      .map((item) => String(item?.word || "").trim())
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  if (Array.isArray(payload.wordsInfo) && payload.wordsInfo.length > 0) {
-    return payload.wordsInfo
-      .map((item) => String(item?.word || "").trim())
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  return "";
-}
-
-function collectTableDetailsDeep(value, results = []) {
-  if (!value || typeof value !== "object") return results;
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectTableDetailsDeep(item, results);
-    }
-    return results;
-  }
-  if (Array.isArray(value.tableDetails)) {
-    for (const item of value.tableDetails) {
-      if (item && typeof item === "object") results.push(item);
-    }
-  }
-  for (const nested of Object.values(value)) {
-    collectTableDetailsDeep(nested, results);
-  }
-  return results;
-}
-
-const OCR_TABLE_HEADER_ALIASES = {
-  "交易日期": ["交易日期", "记账日期", "入账日期", "日期", "交易时间", "交易日", "记账日", "发生日期", "交易日期时间"],
-  "收入": ["收入", "贷方", "贷记", "入账", "转入", "收款金额", "收入金额", "credit", "deposit", "incoming"],
-  "支出": ["支出", "借方", "借记", "出账", "转出", "付款金额", "支出金额", "debit", "payment", "outgoing"],
-  "余额": ["余额", "账户余额", "可用余额", "本次余额", "balance", "available balance"],
-  "对手方": ["对手方", "对方户名", "对方名称", "交易对手", "对方账号名称", "付款方", "收款方", "户名", "对方账户", "counterparty"],
-  "摘要": ["摘要", "备注", "附言", "用途", "说明", "交易摘要", "摘要说明", "摘要内容", "memo", "remark", "note", "description"],
-};
-
-function normalizeHeaderToken(value) {
-  return normalizeFinancialCell(value)
-    .toLowerCase()
-    .replace(/[():：_\-]/g, "")
-    .trim();
-}
-
-function resolveCanonicalHeader(value) {
-  const normalized = normalizeHeaderToken(value);
-  if (!normalized) return "";
-  for (const [canonical, aliases] of Object.entries(OCR_TABLE_HEADER_ALIASES)) {
-    if (aliases.some((alias) => normalized.includes(normalizeHeaderToken(alias)))) {
-      return canonical;
-    }
-  }
-  return "";
-}
-
-function scoreHeaderRow(rowValues) {
-  let score = 0;
-  const columnMappings = new Map();
-  rowValues.forEach((value, index) => {
-    const canonical = resolveCanonicalHeader(value);
-    if (canonical && !columnMappings.has(canonical)) {
-      columnMappings.set(canonical, index);
-      score += 1;
-    }
-  });
-  return { score, columnMappings };
-}
-
-function buildLinesFromOcrTableDetails(tableDetails) {
-  if (!Array.isArray(tableDetails) || tableDetails.length === 0) return [];
-  const output = [];
-
-  for (const table of tableDetails) {
-    const cells = Array.isArray(table?.cellDetails) ? table.cellDetails : [];
-    if (cells.length === 0) continue;
-
-    const rowMap = new Map();
-    for (const cell of cells) {
-      const rowIndex = Number.isFinite(Number(cell?.rowStart)) ? Number(cell.rowStart) : -1;
-      const columnIndex = Number.isFinite(Number(cell?.columnStart)) ? Number(cell.columnStart) : 0;
-      const content = normalizeFinancialCell(cell?.cellContent || "");
-      if (rowIndex < 0 || !content) continue;
-      if (!rowMap.has(rowIndex)) rowMap.set(rowIndex, []);
-      rowMap.get(rowIndex).push({ columnIndex, content });
-    }
-
-    const sortedRows = [...rowMap.entries()].sort((a, b) => a[0] - b[0]);
-    const normalizedRows = sortedRows.map(([rowIndex, rowCells]) => ({
-      rowIndex,
-      values: rowCells
-        .sort((a, b) => a.columnIndex - b.columnIndex)
-        .map((cell) => cell.content)
-        .filter(Boolean),
-    }));
-
-    let headerRowIndex = -1;
-    let headerColumns = new Map();
-    let bestScore = 0;
-    normalizedRows.slice(0, 4).forEach((row) => {
-      const headerScore = scoreHeaderRow(row.values);
-      if (headerScore.score > bestScore) {
-        bestScore = headerScore.score;
-        headerRowIndex = row.rowIndex;
-        headerColumns = headerScore.columnMappings;
-      }
-    });
-
-    const hasMappedHeaders = bestScore >= 2;
-    for (const row of normalizedRows) {
-      if (row.values.length === 0) continue;
-      if (hasMappedHeaders && row.rowIndex === headerRowIndex) continue;
-
-      if (hasMappedHeaders) {
-        const line = [
-          row.values[headerColumns.get("交易日期")] || "",
-          row.values[headerColumns.get("收入")] || "",
-          row.values[headerColumns.get("支出")] || "",
-          row.values[headerColumns.get("余额")] || "",
-          row.values[headerColumns.get("对手方")] || "",
-          row.values[headerColumns.get("摘要")] || "",
-        ]
-          .map((value) => normalizeFinancialCell(value))
-          .join(" | ");
-        if (line.replace(/\s|\|/g, "").length > 0) {
-          output.push(line);
-          continue;
-        }
-      }
-
-      output.push(row.values.join(" | "));
-    }
-  }
-
-  return output;
-}
-
-function parseStructuredOcrDataString(dataString) {
-  if (!dataString) {
-    return { payload: null, structuredLines: [], text: "" };
-  }
-  let payload = null;
-  try {
-    payload = typeof dataString === "string" ? JSON.parse(dataString) : dataString;
-  } catch {
-    const rawText = typeof dataString === "string" ? dataString.trim() : "";
-    return { payload: null, structuredLines: [], text: rawText };
-  }
-
-  const tableDetails = collectTableDetailsDeep(payload, []);
-  const structuredLines = buildLinesFromOcrTableDetails(tableDetails);
-  const plainText = extractTextFromAliyunOcrPayload(payload);
-  return {
-    payload,
-    structuredLines,
-    text: plainText,
-  };
+  docMindClientInstance = new AlibabaCloudDocMind.default(config);
+  return docMindClientInstance;
 }
 
 function createAliyunOcrResponseError(responseCode, detail) {
@@ -939,7 +759,7 @@ async function probeSignedUrlForOcr(fileUrl) {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), Math.min(30_000, OCR_TIMEOUT_MS));
+  const timeout = setTimeout(() => controller.abort(), Math.min(30_000, DOCMIND_HTTP_TIMEOUT_MS));
   try {
     const response = await fetch(url, {
       method: "GET",
@@ -977,76 +797,9 @@ async function probeSignedUrlForOcr(fileUrl) {
   }
 }
 
-async function recognizeDocumentStructureWithAliyun(fileUrl) {
-  const client = getAliyunOcrClient();
-  console.log("[审计] OCR调用: document-structure mode=url");
-  const request = new AlibabaCloudOcr.RecognizeDocumentStructureRequest({
-    url: String(fileUrl || "").trim(),
-    needSortPage: true,
-    outputTable: true,
-    page: true,
-    paragraph: true,
-    row: true,
-    useNewStyleOutput: true,
-  });
-  const response = await withTimeout(client.recognizeDocumentStructure(request), OCR_TIMEOUT_MS);
-  const responseCode = String(response?.body?.code || "").trim();
-  if (responseCode && responseCode !== "200") {
-    throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
-  }
-  return parseStructuredOcrDataString(response?.body?.data || "");
-}
-
-async function recognizeAllTextTableWithAliyun(fileUrl) {
-  const client = getAliyunOcrClient();
-  console.log("[审计] OCR调用: all-text-table mode=url");
-  const request = new AlibabaCloudOcr.RecognizeAllTextRequest({
-    url: String(fileUrl || "").trim(),
-    type: "Advanced",
-    outputCoordinate: "true",
-    tableConfig: new AlibabaCloudOcr.RecognizeAllTextRequestTableConfig({
-      outputTableHtml: true,
-      outputTableExcel: false,
-      isLineLessTable: false,
-      isHandWritingTable: false,
-    }),
-    outputFigure: false,
-    outputBarCode: false,
-    outputStamp: false,
-    outputQrcode: false,
-  });
-  const response = await withTimeout(client.recognizeAllText(request), OCR_TIMEOUT_MS);
-  const responseCode = String(response?.body?.code || "").trim();
-  if (responseCode && responseCode !== "200") {
-    throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
-  }
-  const payload = response?.body?.data || null;
-  const tableDetails = collectTableDetailsDeep(payload, []);
-  const structuredLines = buildLinesFromOcrTableDetails(tableDetails);
-  const plainText = extractTextFromAliyunOcrPayload(payload);
-  return {
-    payload,
-    structuredLines,
-    text: plainText,
-  };
-}
-
-function mergeStructuredOcrOutputs(primary, secondary) {
-  const primaryLines = Array.isArray(primary?.structuredLines) ? primary.structuredLines : [];
-  const secondaryLines = Array.isArray(secondary?.structuredLines) ? secondary.structuredLines : [];
-  const mergedLines = primaryLines.length > 0 ? primaryLines : secondaryLines;
-  const mergedText = [String(primary?.text || "").trim(), String(secondary?.text || "").trim()]
-    .filter(Boolean)
-    .join("\n");
-  return {
-    structuredLines: [...new Set(mergedLines.map((line) => String(line || "").trim()).filter(Boolean))],
-    text: mergedText.trim(),
-  };
-}
-
-async function runAliyunOcrWithRetry(label, task) {
+async function runDocMindWithRetry(label, task) {
   let lastError = null;
-  for (let attempt = 1; attempt <= OCR_NETWORK_RETRY_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       return await task();
     } catch (error) {
@@ -1058,76 +811,150 @@ async function runAliyunOcrWithRetry(label, task) {
         detail.includes("illegalimageurl") ||
         detail.includes("invalid url");
       const retryable = !deterministicClientError && isTransientError(error);
-      if (!retryable || attempt >= OCR_NETWORK_RETRY_ATTEMPTS) {
+      if (!retryable || attempt >= 3) {
         throw error;
       }
-      const waitMs = OCR_NETWORK_RETRY_BASE_DELAY_MS * attempt;
-      console.warn(`[审计] OCR网络重试: ${label} attempt=${attempt}/${OCR_NETWORK_RETRY_ATTEMPTS} wait=${waitMs}ms error=${normalizeErrorMessage(error)}`);
+      const waitMs = 1_500 * attempt;
+      console.warn(`[审计] DocMind重试: ${label} attempt=${attempt}/3 wait=${waitMs}ms error=${normalizeErrorMessage(error)}`);
       await delay(waitMs);
     }
   }
-  throw lastError || new Error(`OCR ${label} failed`);
+  throw lastError || new Error(`DocMind ${label} failed`);
 }
 
-async function recognizePdfTextWithAliyunOcr(fileUrl) {
-  const primary = await runAliyunOcrWithRetry("document-structure", () =>
-    recognizeDocumentStructureWithAliyun(fileUrl)
-  );
-  const hasStructuredRows = Array.isArray(primary?.structuredLines) && primary.structuredLines.length > 0;
-  if (hasStructuredRows) {
-    return primary.structuredLines.join("\n");
-  }
+function extractTextFromDocMindData(data) {
+  const preferred = [];
+  const fallback = [];
+  const seen = new Set();
 
-  const secondary = await runAliyunOcrWithRetry("all-text-table", () =>
-    recognizeAllTextTableWithAliyun(fileUrl)
-  );
-  const merged = mergeStructuredOcrOutputs(primary, secondary);
-  const finalText = merged.structuredLines.length > 0
-    ? merged.structuredLines.join("\n")
-    : merged.text;
-  if (!finalText) {
-    throw createTaggedError(
-      "SCANNED_PDF_OCR_FAILED",
-      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
-      "OCR empty result",
-      502
-    );
-  }
-  return finalText
-    .replace(/\u0000/g, "")
-    .replace(/\r\n/g, "\n")
-    .trim();
+  const pushLine = (line, target) => {
+    const normalized = String(line || "").replace(/\u0000/g, "").trim();
+    if (!normalized) return;
+    if (normalized.length < 2) return;
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    target.push(normalized);
+  };
+
+  const walk = (value, pathKeys = []) => {
+    if (value == null) return;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+        try {
+          walk(JSON.parse(trimmed), pathKeys);
+          return;
+        } catch {
+          // keep raw text
+        }
+      }
+      const keyHint = String(pathKeys[pathKeys.length - 1] || "").toLowerCase();
+      const isPreferred = /(markdown|md|text|content|paragraph|line|table|cell|result|output|value|body)/i.test(keyHint);
+      for (const line of trimmed.split(/\r?\n/)) {
+        pushLine(line, isPreferred ? preferred : fallback);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => walk(item, pathKeys));
+      return;
+    }
+    if (typeof value === "object") {
+      Object.entries(value).forEach(([key, val]) => walk(val, [...pathKeys, key]));
+    }
+  };
+
+  walk(data, []);
+  const output = preferred.length > 0 ? preferred : fallback;
+  return output.join("\n").trim();
 }
 
-async function recognizePdfTextWithAliyunAdvanced(fileUrl) {
-  const response = await runAliyunOcrWithRetry("advanced", async () => {
-    const client = getAliyunOcrClient();
-    console.log("[审计] OCR调用: advanced mode=url");
-    const request = new AlibabaCloudOcr.RecognizeAdvancedRequest({
-      url: String(fileUrl || "").trim(),
-      needSortPage: true,
-      paragraph: true,
-      row: true,
-    });
-    return withTimeout(client.recognizeAdvanced(request), OCR_TIMEOUT_MS);
+async function submitDocMindStructureJob({ signedUrl, fileName }) {
+  const client = getAliyunDocMindClient();
+  const safeFileName = normalizeFilename(fileName || "document.pdf", "document.pdf");
+  const extension = path.extname(safeFileName).replace(/^\./, "").toLowerCase() || "pdf";
+  const request = new AlibabaCloudDocMind.SubmitDocStructureJobRequest({
+    fileName: safeFileName,
+    fileNameExtension: extension,
+    fileUrl: signedUrl,
   });
-  const responseCode = String(response?.body?.code || "").trim();
-  if (responseCode && responseCode !== "200") {
-    throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
+  const response = await withTimeout(
+    runDocMindWithRetry("submit-doc-structure-job", () => client.submitDocStructureJob(request)),
+    DOCMIND_HTTP_TIMEOUT_MS
+  );
+  const code = String(response?.body?.code || "").trim();
+  if (code && code !== "200") {
+    throw createAliyunOcrResponseError(code, String(response?.body?.message || code));
   }
-  const extracted = extractTextFromAliyunOcrPayload(response?.body?.data || "");
-  if (!extracted) {
+  const jobId = String(response?.body?.data?.id || "").trim();
+  if (!jobId) {
     throw createTaggedError(
       "SCANNED_PDF_OCR_FAILED",
-      "扫描件文字识别失败，请确认图片清晰度或稍后再试。",
-      "OCR empty result",
+      "读取云端案卷失败，请重试或截取关键页上传",
+      "DocMind submit missing job id",
       502
     );
   }
-  return extracted
-    .replace(/\u0000/g, "")
-    .replace(/\r\n/g, "\n")
-    .trim();
+  return jobId;
+}
+
+async function pollDocMindStructureResult(jobId, progressReporter = null) {
+  const client = getAliyunDocMindClient();
+  const startedAt = Date.now();
+  const deadline = startedAt + DOCMIND_POLL_TIMEOUT_MS;
+  let pollCount = 0;
+
+  while (Date.now() < deadline) {
+    pollCount += 1;
+    const request = new AlibabaCloudDocMind.GetDocStructureResultRequest({
+      id: jobId,
+      revealMarkdown: true,
+      useUrlResponseBody: false,
+    });
+    const response = await withTimeout(
+      runDocMindWithRetry("get-doc-structure-result", () => client.getDocStructureResult(request)),
+      DOCMIND_HTTP_TIMEOUT_MS
+    );
+    const responseCode = String(response?.body?.code || "").trim();
+    const status = String(response?.body?.status || "").trim().toLowerCase();
+    const completed = Boolean(response?.body?.completed) || ["success", "succeed", "succeeded", "completed", "done", "finished"].includes(status);
+
+    if (responseCode && responseCode !== "200") {
+      throw createAliyunOcrResponseError(responseCode, String(response?.body?.message || responseCode));
+    }
+    if (["failed", "error", "aborted", "cancelled", "canceled"].includes(status)) {
+      throw createTaggedError(
+        "SCANNED_PDF_OCR_FAILED",
+        "读取云端案卷失败，请重试或截取关键页上传",
+        String(response?.body?.message || status || "DocMind job failed"),
+        502
+      );
+    }
+    if (completed) {
+      const text = extractTextFromDocMindData(response?.body?.data || {});
+      if (!text) {
+        throw createTaggedError(
+          "SCANNED_PDF_OCR_FAILED",
+          "读取云端案卷失败，请重试或截取关键页上传",
+          "DocMind empty result",
+          502
+        );
+      }
+      return text;
+    }
+    if (typeof progressReporter === "function") {
+      progressReporter("ocr", `正在识别扫描件文字（任务处理中，第${pollCount}次轮询）`);
+    }
+    await delay(DOCMIND_POLL_INTERVAL_MS);
+  }
+
+  throw createTaggedError(
+    "SCANNED_PDF_OCR_FAILED",
+    "读取云端案卷失败，请重试或截取关键页上传",
+    `DocMind轮询超时（>${DOCMIND_POLL_TIMEOUT_MS}ms）`,
+    504
+  );
 }
 
 async function extractTextWithFallback(filePath, fileUrl = "", progressReporter = null, sourceObjectKey = "") {
@@ -1180,18 +1007,17 @@ async function extractTextWithFallback(filePath, fileUrl = "", progressReporter 
 
   try {
     await probeSignedUrlForOcr(signedFileUrl);
-    let ocrText = "";
-    try {
-      ocrText = await recognizePdfTextWithAliyunOcr(signedFileUrl);
-    } catch (error) {
-      console.warn("[审计] 文档结构化 OCR 未得到可用表格结果，将回退全文 OCR：", normalizeErrorMessage(error));
-      ocrText = await recognizePdfTextWithAliyunAdvanced(signedFileUrl);
-    }
+    const inferredName = normalizedObjectKey ? path.basename(normalizedObjectKey) : path.basename(filePath || "document.pdf");
+    const jobId = await submitDocMindStructureJob({ signedUrl: signedFileUrl, fileName: inferredName });
+    console.log(`[审计] DocMind任务提交成功: jobId=${jobId}`);
+    const ocrText = await pollDocMindStructureResult(jobId, progressReporter);
     return {
       rawText: ocrText,
-      extractor: "aliyun-ocr-structured",
+      extractor: "aliyun-docmind-async",
     };
   } catch (error) {
+    const rawMessage = String(error?.message || error || "");
+    console.error("[DocMind完整错误]:", rawMessage);
     const detail = normalizeErrorMessage(error);
     if (/unexpected token\s*['"]?</i.test(detail) || detail.includes("<?xml")) {
       console.error("[阿里云真实拦截原因]:", detail);

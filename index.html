@@ -1981,6 +1981,7 @@
             clearPendingAttachments({ deleteRemote: false });
             startThinkingProgress(activeConversation.id, timeoutMs);
             renderConversationMessages();
+            let thinkingFinished = false;
             try {
                 const reply = await requestChat(
                     text,
@@ -1995,6 +1996,10 @@
                     renderConversationMessages();
                 }
             } catch (error) {
+                if (!thinkingFinished) {
+                    finishThinkingProgress(activeConversation.id);
+                    thinkingFinished = true;
+                }
                 const errorMessage = `调用失败：${error.message}`;
                 addMessageToConversation(activeConversation.id, "ai", errorMessage);
                 renderHistoryList();
@@ -2002,7 +2007,10 @@
                     renderConversationMessages();
                 }
             } finally {
-                finishThinkingProgress(activeConversation.id);
+                if (!thinkingFinished) {
+                    finishThinkingProgress(activeConversation.id);
+                    thinkingFinished = true;
+                }
                 if (getActiveConversation()?.id === activeConversation.id) {
                     elements.inputField.focus();
                     elements.chatBox.scrollTop = elements.chatBox.scrollHeight;
