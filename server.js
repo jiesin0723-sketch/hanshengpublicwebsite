@@ -6,6 +6,7 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const multer = require("multer");
+const OSS = require("ali-oss");
 const OpenApi = require("@alicloud/openapi-client");
 const AlibabaCloudOcr = require("@alicloud/ocr-api20210707");
 const mammoth = require("mammoth");
@@ -70,6 +71,12 @@ function normalizeHost(value) {
     .trim()
     .replace(/^https?:\/\//i, "")
     .replace(/\/+$/g, "");
+}
+
+function detectOssRegion() {
+  const host = normalizeHost(OSS_ENDPOINT);
+  const match = host.match(/(oss-[a-z0-9-]+)/i);
+  return match ? match[1].toLowerCase() : "";
 }
 
 function hasOssCredentials() {
@@ -232,6 +239,8 @@ const OSS_FORCE_HTTPS = readBool("OSS_FORCE_HTTPS", true);
 const OSS_PUBLIC_BASE_URL = String(process.env.OSS_PUBLIC_BASE_URL || "").trim();
 const OCR_ENDPOINT = String(process.env.OCR_ENDPOINT || "ocr-api.cn-hangzhou.aliyuncs.com").trim();
 const OCR_REGION_ID = String(process.env.OCR_REGION_ID || "cn-hangzhou").trim();
+const OSS_SIGNED_URL_EXPIRE_SECONDS = readPositiveInt("OSS_SIGNED_URL_EXPIRE_SECONDS", 3600);
+const OSS_REGION = String(process.env.OSS_REGION || detectOssRegion()).trim();
 
 const DEFAULT_ALLOWED_MODELS = [
   "gemini-3.1-pro-preview",
@@ -464,6 +473,7 @@ const ai = new GoogleGenAI({
 const sessions = new Map();
 const conversationContexts = new Map();
 const uploadedAttachments = new Map();
+const conversationProgress = new Map();
 const UPLOAD_TMP_DIR = path.join(__dirname, ".upload-tmp");
 fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
 const wordExtractor = new WordExtractor();
@@ -486,6 +496,24 @@ const chatRateLimiter = createInMemoryRateLimiter({
   windowMs: RATE_LIMIT_WINDOW_MS,
   maxRequests: RATE_LIMIT_MAX_REQUESTS,
 });
+
+function getConversationProgressKey(userId, conversationId) {
+  return `${userId}::${conversationId}`;
+}
+
+function setConversationProgress(userId, conversationId, stage, message) {
+  const key = getConversationProgressKey(userId, conversationId);
+  conversationProgress.set(key, {
+    stage: String(stage || "processing"),
+    message: String(message || "处理中"),
+    updatedAt: Date.now(),
+  });
+}
+
+function clearConversationProgress(userId, conversationId) {
+  const key = getConversationProgressKey(userId, conversationId);
+  conversationProgress.delete(key);
+}
 
 app.disable("x-powered-by");
 app.set("trust proxy", TRUST_PROXY);
@@ -663,6 +691,30 @@ function createTaggedError(code, message, detail = "", statusCode = 500) {
 }
 
 let ocrClientInstance = null;
+let ossClientInstance = null;
+
+function getOssClient() {
+  if (ossClientInstance) return ossClientInstance;
+  if (!OSS_BUCKET || !OSS_ACCESS_KEY_ID || !OSS_ACCESS_KEY_SECRET || !OSS_REGION) {
+    throw createTaggedError("OSS_NOT_CONFIGURED", "OSS 签名链接生成失败，请检查 OSS 配置。", "", 500);
+  }
+  ossClientInstance = new OSS({
+    region: OSS_REGION,
+    bucket: OSS_BUCKET,
+    accessKeyId: OSS_ACCESS_KEY_ID,
+    accessKeySecret: OSS_ACCESS_KEY_SECRET,
+    secure: OSS_FORCE_HTTPS,
+  });
+  return ossClientInstance;
+}
+
+function buildSignedOssReadUrl(objectKey, expires = OSS_SIGNED_URL_EXPIRE_SECONDS) {
+  const client = getOssClient();
+  return client.signatureUrl(String(objectKey || "").replace(/^\/+/, ""), {
+    expires: Math.max(60, expires),
+    method: "GET",
+  });
+}
 
 function getAliyunOcrClient() {
   if (ocrClientInstance) return ocrClientInstance;
@@ -993,7 +1045,7 @@ async function recognizePdfTextWithAliyunAdvanced(fileUrl) {
     .trim();
 }
 
-async function extractTextWithFallback(filePath, fileUrl = "") {
+async function extractTextWithFallback(filePath, fileUrl = "", progressReporter = null) {
   let pdfParsedText = "";
   try {
     pdfParsedText = await parsePdfToText(filePath);
@@ -1022,6 +1074,9 @@ async function extractTextWithFallback(filePath, fileUrl = "") {
   }
 
   console.log("[审计] 触发阿里云 OCR 兜底识别");
+  if (typeof progressReporter === "function") {
+    progressReporter("ocr", "正在识别扫描件文字");
+  }
   let ocrText = "";
   try {
     ocrText = await recognizePdfTextWithAliyunOcr(fileUrl);
@@ -1383,6 +1438,35 @@ function buildFinancialDataPayload({ rawText, attachmentName }) {
   };
 }
 
+function createDeferredUploadedAttachmentRecord({
+  userId,
+  conversationId,
+  objectKey,
+  fileName,
+  mimeType,
+  size,
+}) {
+  return {
+    id: nextUploadAttachmentId(),
+    userId,
+    conversationId,
+    name: normalizeFilename(fileName, "附件"),
+    mimeType,
+    size: Number(size) || 0,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + UPLOAD_ATTACHMENT_TTL_MS,
+    kind: "remote",
+    objectKey: String(objectKey || "").replace(/^\/+/, ""),
+    fileUri: "",
+    data: "",
+    geminiFileName: "",
+    text: "",
+    textLimit: TEXT_EXTRACT_MAX_CHARS,
+    isFinancialData: false,
+    usedChunkSummary: false,
+  };
+}
+
 async function uploadBinaryFileToGemini({ filePath, mimeType, displayName }) {
   const uploadedFile = await ai.files.upload({
     file: filePath,
@@ -1399,7 +1483,7 @@ async function uploadBinaryFileToGemini({ filePath, mimeType, displayName }) {
   return { fileUri, geminiFileName };
 }
 
-async function createUploadedAttachmentRecord({ file, userId, conversationId, sourceFileUrl = "" }) {
+async function createUploadedAttachmentRecord({ file, userId, conversationId, sourceFileUrl = "", progressReporter = null }) {
   const name = normalizeFilename(file?.originalname, "附件");
   const mimeType = normalizeUploadMimeType(file?.mimetype, name);
   if (!mimeType) {
@@ -1455,7 +1539,7 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId, so
     if (mimeType === "application/pdf") {
       const shouldPreferTextPath = Number(file?.size || 0) >= LARGE_PDF_PARSE_THRESHOLD_BYTES;
       try {
-        const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl);
+        const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter);
         const pdfText = extractedPdf.rawText;
         if (pdfText) {
           if (looksLikeFinancialPdf(name, pdfText)) {
@@ -1507,7 +1591,7 @@ async function createUploadedAttachmentRecord({ file, userId, conversationId, so
         // PDF上传失败时，优先走文本解析兜底，避免用户上传即失败。
         if (mimeType === "application/pdf") {
           try {
-            const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl);
+            const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter);
             const pdfText = extractedPdf.rawText;
             if (pdfText) {
               record.kind = "text";
@@ -1624,6 +1708,15 @@ function mapUploadedRecordToAttachment(record) {
       usedChunkSummary: Boolean(record.usedChunkSummary),
     };
   }
+  if (record.kind === "remote") {
+    return {
+      kind: "remote",
+      name: record.name,
+      mimeType: record.mimeType,
+      size: Number(record.size) || 0,
+      objectKey: record.objectKey || "",
+    };
+  }
   return {
     kind: "binary",
     name: record.name,
@@ -1646,6 +1739,51 @@ function resolveUploadedAttachments({ userId, conversationId, attachmentIds }) {
     resolved.push(record);
   }
   return { resolved, missing };
+}
+
+async function materializeUploadedAttachmentRecord(record, progressReporter = null) {
+  if (!record || record.kind !== "remote") return record;
+  if (typeof progressReporter === "function") {
+    progressReporter("attachment", `正在读取附件：${record.name}`);
+  }
+  const signedUrl = buildSignedOssReadUrl(record.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
+  const downloaded = await downloadRemoteFileToTemp({
+    fileUrl: signedUrl,
+    expectedSize: record.size,
+    fileName: record.name,
+  });
+  const processed = await createUploadedAttachmentRecord({
+    file: {
+      originalname: record.name,
+      mimetype: record.mimeType,
+      size: downloaded.size,
+      path: downloaded.path,
+    },
+    userId: record.userId,
+    conversationId: record.conversationId,
+    sourceFileUrl: signedUrl,
+    progressReporter,
+  });
+  const materialized = {
+    ...record,
+    ...processed,
+    id: record.id,
+    userId: record.userId,
+    conversationId: record.conversationId,
+    createdAt: record.createdAt,
+    expiresAt: Date.now() + UPLOAD_ATTACHMENT_TTL_MS,
+    objectKey: record.objectKey,
+  };
+  uploadedAttachments.set(materialized.id, materialized);
+  return materialized;
+}
+
+async function materializeUploadedAttachments(records, progressReporter = null) {
+  const output = [];
+  for (const record of records || []) {
+    output.push(await materializeUploadedAttachmentRecord(record, progressReporter));
+  }
+  return output;
 }
 
 function uploadSingleFileMiddleware(req, res, next) {
@@ -1832,7 +1970,7 @@ async function handleUploadComplete(req, res) {
   }
 
   try {
-    const signedUrl = buildSignedOssGetUrl(objectKey, 300);
+    const signedUrl = buildSignedOssReadUrl(objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
     if (!signedUrl) {
       return res.status(500).json({
         success: false,
@@ -1840,27 +1978,20 @@ async function handleUploadComplete(req, res) {
         message: "无法生成 OSS 下载签名，请检查 OSS 配置",
       });
     }
-    const downloaded = await downloadRemoteFileToTemp({
-      fileUrl: signedUrl,
-      expectedSize,
-      fileName,
-    });
-
-    const record = await createUploadedAttachmentRecord({
-      file: {
-        originalname: fileName,
-        mimetype: mimeType,
-        size: downloaded.size,
-        path: downloaded.path,
-      },
+    const record = createDeferredUploadedAttachmentRecord({
       userId: req.authUser.id,
       conversationId,
-      sourceFileUrl: signedUrl,
+      objectKey,
+      fileName,
+      mimeType,
+      size: expectedSize,
     });
     uploadedAttachments.set(record.id, record);
 
     return res.json({
+      status: "success",
       success: true,
+      url: signedUrl,
       attachment: {
         id: record.id,
         name: record.name,
@@ -1875,7 +2006,6 @@ async function handleUploadComplete(req, res) {
     const detail = normalizeErrorMessage(error);
     const isNetwork = isNetworkError(error);
     const isTimeout = /timeout|timed out|aborted/i.test(detail);
-    const ocrFailed = String(error?.code || "") === "SCANNED_PDF_OCR_FAILED";
     console.error(
       "OSS回填失败:",
       `user=${req.authUser.id}`,
@@ -1883,19 +2013,15 @@ async function handleUploadComplete(req, res) {
       `objectKey=${objectKey}`,
       detail
     );
-    return res.status(ocrFailed || isNetwork || isTimeout ? 502 : 500).json({
+    return res.status(isNetwork || isTimeout ? 502 : 500).json({
       status: "error",
       success: false,
-      errorCode: ocrFailed
-        ? "SCANNED_PDF_OCR_FAILED"
-        : isTimeout
+      errorCode: isTimeout
         ? "OSS_FETCH_TIMEOUT"
         : isNetwork
         ? "OSS_FETCH_NETWORK_ERROR"
         : "OSS_COMPLETE_FAILED",
-      message: ocrFailed
-        ? "扫描件文字识别失败，请确认图片清晰度或稍后再试。"
-        : isTimeout
+      message: isTimeout
         ? "直传文件回填超时，请稍后重试"
         : isNetwork
         ? "后端拉取 OSS 文件失败，请检查网络和 OSS 访问策略"
@@ -2025,6 +2151,18 @@ app.get("/api/models", requireAuth, (_req, res) => {
     success: true,
     models: ALLOWED_MODELS,
     defaultModel: DEFAULT_MODEL,
+  });
+});
+
+app.get("/api/chat-progress", requireAuth, (req, res) => {
+  const conversationId = normalizeConversationId(req.query?.conversationId);
+  const key = getConversationProgressKey(req.authUser.id, conversationId);
+  const progress = conversationProgress.get(key);
+  return res.json({
+    success: true,
+    stage: progress?.stage || "",
+    message: progress?.message || "",
+    updatedAt: Number(progress?.updatedAt || 0),
   });
 });
 
@@ -2748,9 +2886,13 @@ async function handleChat(req, res) {
   const rawMessage = req.body?.message ?? req.body?.question;
   const userMessage = typeof rawMessage === "string" ? rawMessage.trim() : "";
   const conversationId = normalizeConversationId(req.body?.conversationId);
+  const updateProgress = (stage, message) => {
+    setConversationProgress(req.authUser.id, conversationId, stage, message);
+  };
   const attachmentIds = normalizeAttachmentIds(req.body?.attachmentIds);
   const legacyAttachments = normalizeAttachments(req.body?.attachments);
   let attachments = legacyAttachments;
+  updateProgress("thinking", "正在深度思考");
   if (attachmentIds.length > 0) {
     const uploaded = resolveUploadedAttachments({
       userId: req.authUser.id,
@@ -2764,7 +2906,24 @@ async function handleChat(req, res) {
         missingAttachmentIds: uploaded.missing,
       });
     }
-    attachments = uploaded.resolved.map(mapUploadedRecordToAttachment).filter(Boolean);
+    try {
+      const materializedRecords = await materializeUploadedAttachments(uploaded.resolved, updateProgress);
+      attachments = materializedRecords.map(mapUploadedRecordToAttachment).filter(Boolean);
+    } catch (attachmentError) {
+      const errorCode = String(attachmentError?.code || "");
+      const detail = normalizeErrorMessage(attachmentError);
+      const ocrFailed = errorCode === "SCANNED_PDF_OCR_FAILED";
+      clearConversationProgress(req.authUser.id, conversationId);
+      return res.status(ocrFailed ? 502 : 500).json({
+        status: "error",
+        success: false,
+        errorCode: ocrFailed ? "SCANNED_PDF_OCR_FAILED" : "ATTACHMENT_PROCESSING_FAILED",
+        message: ocrFailed
+          ? "扫描件文字识别失败，请确认图片清晰度或稍后再试。"
+          : "附件处理失败，请稍后重试。",
+        error: detail,
+      });
+    }
   }
   const requestedModel = req.body?.model;
   const modelResult = resolveRequestModel(requestedModel);
@@ -2823,6 +2982,7 @@ async function handleChat(req, res) {
   });
 
   try {
+    updateProgress("model", "正在深度思考");
     const generationResult = await generateReplyWithRetry({
       model: activeModel,
       contents,
@@ -2886,6 +3046,8 @@ async function handleChat(req, res) {
       message: mappedError.userMessage,
       error: mappedError.detail,
     });
+  } finally {
+    clearConversationProgress(req.authUser.id, conversationId);
   }
 }
 

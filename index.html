@@ -594,7 +594,8 @@
                 sessionExpired: "登录状态已过期，请重新登录。",
                 loginFailed: "账号或密码错误，请重新输入。",
                 noBackend: "无法连接后端服务，请确认后端已启动。",
-                thinkingStatus: "正在深度思考...",
+                thinkingStatus: "正在深度思考",
+                ocrStatus: "正在识别扫描件文字",
                 thinkingEta: "预计剩余 {s} 秒",
                 deleteConversationConfirm: "确定删除该历史对话吗？该操作不可恢复。",
                 deleteConversationTitle: "删除会话",
@@ -632,7 +633,8 @@
                 sessionExpired: "Session expired. Please login again.",
                 loginFailed: "Invalid account or password.",
                 noBackend: "Cannot connect to backend service.",
-                thinkingStatus: "Analyzing deeply...",
+                thinkingStatus: "Analyzing deeply",
+                ocrStatus: "Recognizing scanned document text",
                 thinkingEta: "Estimated remaining {s}s",
                 deleteConversationConfirm: "Delete this conversation history? This action cannot be undone.",
                 deleteConversationTitle: "Delete Conversation",
@@ -1697,6 +1699,14 @@
             }
         }
 
+        function getProgressStatusLabel(stage, message) {
+            const normalizedStage = String(stage || "").trim().toLowerCase();
+            const normalizedMessage = String(message || "").trim();
+            if (normalizedMessage) return normalizedMessage;
+            if (normalizedStage === "ocr") return i18n[currentLang].ocrStatus;
+            return i18n[currentLang].thinkingStatus;
+        }
+
         function getActiveRequestState() {
             const conversation = getActiveConversation();
             if (!conversation) return null;
@@ -1718,7 +1728,7 @@
 
             elements.thinkingStatus.hidden = false;
             elements.thinkingBar.style.width = "2%";
-            elements.thinkingText.textContent = i18n[currentLang].thinkingStatus;
+            elements.thinkingText.textContent = getProgressStatusLabel(requestState.progressStage, requestState.progressMessage);
             elements.thinkingEta.textContent = i18n[currentLang].thinkingEta.replace("{s}", String(Math.ceil(totalMs / 1000)));
 
             const tick = () => {
@@ -1726,6 +1736,25 @@
                 const ratio = Math.min(0.95, elapsed / totalMs);
                 const percent = Math.max(2, Math.floor(ratio * 100));
                 const remainSec = Math.max(0, Math.ceil((totalMs - elapsed) / 1000));
+                const now = Date.now();
+                if (!requestState.progressFetchInFlight && (!requestState.lastProgressFetchAt || now - requestState.lastProgressFetchAt >= 1200)) {
+                    requestState.progressFetchInFlight = true;
+                    requestState.lastProgressFetchAt = now;
+                    fetchConversationProgress(requestState.conversationId)
+                        .then((progress) => {
+                            if (!progress || !activeRequests.has(requestState.conversationId)) return;
+                            const liveState = activeRequests.get(requestState.conversationId);
+                            if (!liveState) return;
+                            liveState.progressStage = String(progress.stage || "");
+                            liveState.progressMessage = getProgressStatusLabel(progress.stage, progress.message);
+                            if (getActiveRequestState()?.conversationId === requestState.conversationId) {
+                                elements.thinkingText.textContent = liveState.progressMessage;
+                            }
+                        })
+                        .finally(() => {
+                            requestState.progressFetchInFlight = false;
+                        });
+                }
                 elements.thinkingBar.style.width = `${percent}%`;
                 elements.thinkingEta.textContent = i18n[currentLang].thinkingEta.replace("{s}", String(remainSec));
             };
@@ -1737,7 +1766,11 @@
             activeRequests.set(conversationId, {
                 conversationId,
                 startedAt: Date.now(),
-                timeoutMs: expectedMs
+                timeoutMs: expectedMs,
+                progressStage: "thinking",
+                progressMessage: i18n[currentLang].thinkingStatus,
+                lastProgressFetchAt: 0,
+                progressFetchInFlight: false
             });
             syncThinkingProgress();
         }
@@ -1843,7 +1876,7 @@
                 const data = await requestBackend("/api/chat", {
                     method: "POST",
                     requireAuth: true,
-                    timeoutMs: Math.max(20_000, Number(timeoutMs) + 20_000),
+                    timeoutMs: Math.min(300_000, Math.max(180_000, Number(timeoutMs) + 60_000)),
                     body: {
                         message: text,
                         attachmentIds,
@@ -1867,6 +1900,20 @@
                 if (errorCode === "UPSTREAM_TIMEOUT" || /超时/i.test(message)) throw new Error(i18n[currentLang].timeoutError);
                 if (errorCode === "UPSTREAM_NETWORK_ERROR" || /代理|network|后端服务/i.test(message)) throw new Error(i18n[currentLang].networkError);
                 throw error;
+            }
+        }
+
+        async function fetchConversationProgress(conversationId) {
+            if (!conversationId) return null;
+            try {
+                const data = await requestBackend(`/api/chat-progress?conversationId=${encodeURIComponent(conversationId)}`, {
+                    method: "GET",
+                    requireAuth: true,
+                    timeoutMs: 15_000
+                });
+                return data;
+            } catch {
+                return null;
             }
         }
 
