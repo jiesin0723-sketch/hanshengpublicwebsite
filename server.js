@@ -232,8 +232,13 @@ const OCR_PDF_MIN_TEXT_CHARS = readPositiveInt("OCR_PDF_MIN_TEXT_CHARS", 200);
 const ASYNC_ATTACHMENT_CONTEXT_CHARS = readPositiveInt("ASYNC_ATTACHMENT_CONTEXT_CHARS", 120_000);
 const DOCMIND_HTTP_TIMEOUT_MS = readPositiveInt("DOCMIND_HTTP_TIMEOUT_MS", 120_000);
 const DOCMIND_POLL_INTERVAL_MS = readPositiveInt("DOCMIND_POLL_INTERVAL_MS", 3_000);
-const DOCMIND_POLL_TIMEOUT_MS = readPositiveInt("DOCMIND_POLL_TIMEOUT_MS", 3 * 60 * 1000);
-const DOCMIND_POLL_MAX_ATTEMPTS = readPositiveInt("DOCMIND_POLL_MAX_ATTEMPTS", 100);
+const DOCMIND_POLL_TIMEOUT_MS = readPositiveInt("DOCMIND_POLL_TIMEOUT_MS", 15 * 60 * 1000);
+const DOCMIND_POLL_MAX_ATTEMPTS = readPositiveInt(
+  "DOCMIND_POLL_MAX_ATTEMPTS",
+  Math.max(100, Math.ceil(DOCMIND_POLL_TIMEOUT_MS / DOCMIND_POLL_INTERVAL_MS))
+);
+const DOCMIND_TIMEOUT_RETRY_DELAY_MS = readPositiveInt("DOCMIND_TIMEOUT_RETRY_DELAY_MS", 15_000);
+const DOCMIND_TIMEOUT_RETRY_LIMIT = readPositiveInt("DOCMIND_TIMEOUT_RETRY_LIMIT", 6);
 const OSS_ENABLED = readBool("OSS_ENABLED", true);
 const OSS_BUCKET = String(process.env.OSS_BUCKET || "").trim();
 const OSS_ENDPOINT = String(process.env.OSS_ENDPOINT || "").trim();
@@ -481,6 +486,7 @@ const sessions = new Map();
 const conversationContexts = new Map();
 const uploadedAttachments = new Map();
 const attachmentMaterializationTasks = new Map();
+const processingFiles = new Map();
 const conversationProgress = new Map();
 const UPLOAD_TMP_DIR = path.join(__dirname, ".upload-tmp");
 fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
@@ -949,6 +955,8 @@ async function submitDocMindStructureJob({ signedUrl, fileName }) {
 async function pollDocMindStructureResult(jobId, progressReporter = null) {
   const client = getAliyunDocMindClient();
   const maxAttempts = Math.max(1, DOCMIND_POLL_MAX_ATTEMPTS);
+  const timeoutLimitMs = Math.max(DOCMIND_POLL_INTERVAL_MS, DOCMIND_POLL_TIMEOUT_MS);
+  const deadlineAt = Date.now() + timeoutLimitMs;
   const RuntimeOptions = TeaUtil.RuntimeOptions;
   const runtime = new RuntimeOptions({
     connectTimeout: 15000,
@@ -957,7 +965,7 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
     maxAttempts: 3,
   });
   let attempt = 0;
-  while (attempt < maxAttempts) {
+  while (attempt < maxAttempts && Date.now() < deadlineAt) {
     attempt += 1;
     const request = new AlibabaCloudDocMind.GetDocStructureResultRequest({
       id: jobId,
@@ -1035,16 +1043,23 @@ async function pollDocMindStructureResult(jobId, progressReporter = null) {
     await sleep(DOCMIND_POLL_INTERVAL_MS);
   }
 
-  const timeoutMs = maxAttempts * DOCMIND_POLL_INTERVAL_MS;
-  throw createTaggedError(
-    "SCANNED_PDF_OCR_FAILED",
-    "读取云端案卷失败，请重试或截取关键页上传",
-    `DocMind轮询超时（>${timeoutMs}ms）`,
+  const timeoutError = createTaggedError(
+    "DOCMIND_POLL_TIMEOUT",
+    "扫描件识别耗时较长，系统仍在后台继续处理，请稍后再试。",
+    `DocMind轮询超时（>${timeoutLimitMs}ms）`,
     504
   );
+  timeoutError.jobId = String(jobId || "").trim();
+  throw timeoutError;
 }
 
-async function extractTextWithFallback(filePath, fileUrl = "", progressReporter = null, sourceObjectKey = "") {
+async function extractTextWithFallback(
+  filePath,
+  fileUrl = "",
+  progressReporter = null,
+  sourceObjectKey = "",
+  existingDocMindJobId = ""
+) {
   let pdfParsedText = "";
   try {
     pdfParsedText = await parsePdfToText(filePath);
@@ -1095,14 +1110,23 @@ async function extractTextWithFallback(filePath, fileUrl = "", progressReporter 
   try {
     await probeSignedUrlForOcr(signedFileUrl);
     const inferredName = normalizedObjectKey ? path.basename(normalizedObjectKey) : path.basename(filePath || "document.pdf");
-    const jobId = await submitDocMindStructureJob({ signedUrl: signedFileUrl, fileName: inferredName });
-    console.log(`[审计] DocMind任务提交成功: jobId=${jobId}`);
+    const normalizedJobId = String(existingDocMindJobId || "").trim();
+    const jobId = normalizedJobId || (await submitDocMindStructureJob({ signedUrl: signedFileUrl, fileName: inferredName }));
+    if (normalizedJobId) {
+      console.log(`[审计] DocMind任务续轮询: jobId=${jobId}`);
+    } else {
+      console.log(`[审计] DocMind任务提交成功: jobId=${jobId}`);
+    }
     const ocrText = await pollDocMindStructureResult(jobId, progressReporter);
     return {
       rawText: ocrText,
       extractor: "aliyun-docmind-async",
+      docMindJobId: "",
     };
   } catch (error) {
+    if (String(error?.code || "") === "DOCMIND_POLL_TIMEOUT") {
+      throw error;
+    }
     logDocMindRawError("[DocMind完整错误]", error);
     const detail = normalizeErrorMessage(error);
     if (/unexpected token\s*['"]?</i.test(detail) || detail.includes("<?xml")) {
@@ -1494,6 +1518,8 @@ function createDeferredUploadedAttachmentRecord({
     parseStatus: "pending",
     parseMessage: "AI后台识别排队中",
     parseError: "",
+    parseAttempts: 0,
+    docMindJobId: "",
     parseStartedAt: 0,
     parseFinishedAt: 0,
     contextInjected: false,
@@ -1522,6 +1548,7 @@ async function createUploadedAttachmentRecord({
   conversationId,
   sourceFileUrl = "",
   sourceObjectKey = "",
+  sourceDocMindJobId = "",
   progressReporter = null,
 }) {
   const name = normalizeFilename(file?.originalname, "附件");
@@ -1547,6 +1574,7 @@ async function createUploadedAttachmentRecord({
     fileUri: "",
     data: "",
     geminiFileName: "",
+    docMindJobId: "",
   };
 
   try {
@@ -1579,7 +1607,13 @@ async function createUploadedAttachmentRecord({
     if (mimeType === "application/pdf") {
       const shouldPreferTextPath = Number(file?.size || 0) >= LARGE_PDF_PARSE_THRESHOLD_BYTES;
       try {
-        const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter, sourceObjectKey);
+        const extractedPdf = await extractTextWithFallback(
+          file.path,
+          sourceFileUrl,
+          progressReporter,
+          sourceObjectKey,
+          sourceDocMindJobId
+        );
         const pdfText = extractedPdf.rawText;
         if (pdfText) {
           if (looksLikeFinancialPdf(name, pdfText)) {
@@ -1607,7 +1641,8 @@ async function createUploadedAttachmentRecord({
           }
         }
       } catch (pdfParseError) {
-        if (String(pdfParseError?.code || "") === "SCANNED_PDF_OCR_FAILED") {
+        const errorCode = String(pdfParseError?.code || "");
+        if (errorCode === "SCANNED_PDF_OCR_FAILED" || errorCode === "DOCMIND_POLL_TIMEOUT") {
           throw pdfParseError;
         }
         if (shouldPreferTextPath) {
@@ -1631,7 +1666,13 @@ async function createUploadedAttachmentRecord({
         // PDF上传失败时，优先走文本解析兜底，避免用户上传即失败。
         if (mimeType === "application/pdf") {
           try {
-            const extractedPdf = await extractTextWithFallback(file.path, sourceFileUrl, progressReporter, sourceObjectKey);
+            const extractedPdf = await extractTextWithFallback(
+              file.path,
+              sourceFileUrl,
+              progressReporter,
+              sourceObjectKey,
+              sourceDocMindJobId
+            );
             const pdfText = extractedPdf.rawText;
             if (pdfText) {
               record.kind = "text";
@@ -1641,7 +1682,8 @@ async function createUploadedAttachmentRecord({
               return record;
             }
           } catch (fallbackPdfError) {
-            if (String(fallbackPdfError?.code || "") === "SCANNED_PDF_OCR_FAILED") {
+            const errorCode = String(fallbackPdfError?.code || "");
+            if (errorCode === "SCANNED_PDF_OCR_FAILED" || errorCode === "DOCMIND_POLL_TIMEOUT") {
               throw fallbackPdfError;
             }
             // continue fallback
@@ -1782,6 +1824,18 @@ function resolveUploadedAttachments({ userId, conversationId, attachmentIds }) {
   return { resolved, missing };
 }
 
+function findUploadedAttachmentByObjectKey({ userId, conversationId, objectKey }) {
+  const normalizedObjectKey = String(objectKey || "").trim().replace(/^\/+/, "");
+  if (!normalizedObjectKey) return null;
+  for (const record of uploadedAttachments.values()) {
+    if (!record) continue;
+    if (record.userId !== userId || record.conversationId !== conversationId) continue;
+    if (String(record.objectKey || "").trim() !== normalizedObjectKey) continue;
+    return record;
+  }
+  return null;
+}
+
 async function materializeUploadedAttachmentRecord(record, progressReporter = null) {
   if (!record || record.kind !== "remote") return record;
   if (typeof progressReporter === "function") {
@@ -1804,6 +1858,7 @@ async function materializeUploadedAttachmentRecord(record, progressReporter = nu
     conversationId: record.conversationId,
     sourceFileUrl: signedUrl,
     sourceObjectKey: record.objectKey,
+    sourceDocMindJobId: record.docMindJobId || "",
     progressReporter,
   });
   const materialized = {
@@ -1815,6 +1870,8 @@ async function materializeUploadedAttachmentRecord(record, progressReporter = nu
     createdAt: record.createdAt,
     expiresAt: Date.now() + UPLOAD_ATTACHMENT_TTL_MS,
     objectKey: record.objectKey,
+    parseAttempts: 0,
+    docMindJobId: "",
   };
   uploadedAttachments.set(materialized.id, materialized);
   return materialized;
@@ -1849,6 +1906,15 @@ function scheduleAttachmentMaterialization(record) {
   if (attachmentMaterializationTasks.has(current.id)) return;
   if (current.kind !== "remote") return;
   if (current.parseStatus === "processing") return;
+  const objectKey = String(current.objectKey || "").trim();
+  if (objectKey && processingFiles.has(objectKey)) {
+    current.parseStatus = "processing";
+    current.parseMessage = "AI后台深度识别中";
+    current.parseError = "";
+    current.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+    uploadedAttachments.set(current.id, current);
+    return;
+  }
 
   current.parseStatus = "processing";
   current.parseMessage = "AI后台深度识别中";
@@ -1876,6 +1942,35 @@ function scheduleAttachmentMaterialization(record) {
       if (!uploadedAttachments.has(current.id)) {
         return;
       }
+      const errorCode = String(error?.code || "").trim();
+      if (errorCode === "DOCMIND_POLL_TIMEOUT") {
+        const nextAttempts = Number(latest.parseAttempts || 0) + 1;
+        const timeoutJobId = String(error?.jobId || latest.docMindJobId || "").trim();
+        latest.parseStatus = "pending";
+        latest.parseMessage = "案卷较大，后台识别时间较长，系统将继续处理";
+        latest.parseError = "";
+        latest.parseAttempts = nextAttempts;
+        latest.docMindJobId = timeoutJobId;
+        latest.parseFinishedAt = 0;
+        latest.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+        uploadedAttachments.set(latest.id, latest);
+        console.warn(
+          "后台案卷识别超时，进入续轮询:",
+          `user=${latest.userId}`,
+          `conversation=${latest.conversationId}`,
+          `attachment=${latest.id}`,
+          `jobId=${timeoutJobId || "(missing)"}`,
+          `attempt=${nextAttempts}/${DOCMIND_TIMEOUT_RETRY_LIMIT}`
+        );
+        if (nextAttempts <= DOCMIND_TIMEOUT_RETRY_LIMIT) {
+          setTimeout(() => {
+            const latestRecord = uploadedAttachments.get(latest.id);
+            if (!latestRecord || latestRecord.kind !== "remote") return;
+            scheduleAttachmentMaterialization(latestRecord);
+          }, DOCMIND_TIMEOUT_RETRY_DELAY_MS);
+          return;
+        }
+      }
       latest.parseStatus = "failed";
       latest.parseMessage = "后台识别失败";
       latest.parseError = normalizeErrorMessage(error);
@@ -1891,10 +1986,16 @@ function scheduleAttachmentMaterialization(record) {
       );
     } finally {
       attachmentMaterializationTasks.delete(current.id);
+      if (objectKey) {
+        processingFiles.delete(objectKey);
+      }
     }
   })();
 
   attachmentMaterializationTasks.set(current.id, task);
+  if (objectKey) {
+    processingFiles.set(objectKey, true);
+  }
 }
 
 function uploadSingleFileMiddleware(req, res, next) {
@@ -2089,6 +2190,40 @@ async function handleUploadComplete(req, res) {
         message: "无法生成 OSS 下载签名，请检查 OSS 配置",
       });
     }
+    const existingRecord = findUploadedAttachmentByObjectKey({
+      userId: req.authUser.id,
+      conversationId,
+      objectKey,
+    });
+    if (existingRecord) {
+      existingRecord.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+      if (existingRecord.kind === "remote") {
+        scheduleAttachmentMaterialization(existingRecord);
+      }
+      const parseStatus = String(existingRecord.parseStatus || "").toLowerCase();
+      const message = parseStatus === "ready"
+        ? "案卷已在后台识别完成，可直接提问。"
+        : parseStatus === "failed"
+        ? "案卷后台识别失败，请重新上传或截取关键页后重试。"
+        : "案卷已接收，AI 正在后台深度识别中，请稍候提问...";
+      uploadedAttachments.set(existingRecord.id, existingRecord);
+      return res.json({
+        status: "success",
+        success: true,
+        message,
+        url: signedUrl,
+        attachment: {
+          id: existingRecord.id,
+          name: existingRecord.name,
+          mimeType: existingRecord.mimeType,
+          size: existingRecord.size,
+          kind: existingRecord.kind,
+          conversationId: existingRecord.conversationId,
+          source: "oss",
+          parseStatus: existingRecord.parseStatus || "",
+        },
+      });
+    }
     const record = createDeferredUploadedAttachmentRecord({
       userId: req.authUser.id,
       conversationId,
@@ -2113,6 +2248,7 @@ async function handleUploadComplete(req, res) {
         kind: record.kind,
         conversationId: record.conversationId,
         source: "oss",
+        parseStatus: record.parseStatus || "",
       },
     });
   } catch (error) {
@@ -3036,8 +3172,8 @@ async function handleChat(req, res) {
         });
       }
       clearConversationProgress(req.authUser.id, conversationId);
-      return res.status(425).json({
-        status: "error",
+      return res.json({
+        status: "processing",
         success: false,
         errorCode: "ATTACHMENT_PARSING_IN_PROGRESS",
         message: "案卷过大，AI 仍在深度阅卷中，请耐心等待 1-2 分钟后再试。",
