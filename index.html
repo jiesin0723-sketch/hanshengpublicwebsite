@@ -1552,17 +1552,24 @@
             });
         }
 
-        async function uploadAttachmentViaOss(item, conversationId) {
-            const presign = await requestBackend("/api/uploads/presign", {
+        async function requestOssPresign(conversationId, item, uploadMethod = "") {
+            const body = {
+                conversationId,
+                fileName: item.name,
+                mimeType: item.mimeType,
+                size: item.size
+            };
+            if (uploadMethod) {
+                body.uploadMethod = uploadMethod;
+            }
+            return requestBackend("/api/uploads/presign", {
                 method: "POST",
                 requireAuth: true,
-                body: {
-                    conversationId,
-                    fileName: item.name,
-                    mimeType: item.mimeType,
-                    size: item.size
-                }
+                body
             });
+        }
+
+        async function executeOssUpload(item, presign) {
             const uploadMethod = String(presign?.method || "POST").toUpperCase();
             const needsFields = uploadMethod !== "PUT";
             if (!presign?.success || !presign.uploadUrl || !presign.objectKey || (needsFields && !presign.fields)) {
@@ -1590,7 +1597,7 @@
                         resolve();
                         return;
                     }
-                    const ossText = String(xhr.responseText || "").trim().slice(0, 180);
+                    const ossText = String(xhr.responseText || "").trim().slice(0, 500);
                     reject(new Error(`OSS上传失败（${xhr.status}）${ossText ? `：${ossText}` : ""}`));
                 };
                 xhr.onerror = () => reject(new Error("OSS network error（请检查OSS CORS、HTTPS协议与Endpoint）"));
@@ -1617,6 +1624,26 @@
                 formData.append("file", item.file, item.name);
                 xhr.send(formData);
             });
+        }
+
+        function shouldFallbackToPost(uploadMethod, error) {
+            const method = String(uploadMethod || "").toUpperCase();
+            if (method !== "PUT") return false;
+            const message = String(error?.message || "");
+            return /SignatureDoesNotMatch|403|InvalidAccessKeyId|AccessDenied|OSS network error|CORS|Load failed/i.test(message);
+        }
+
+        async function uploadAttachmentViaOss(item, conversationId) {
+            let presign = await requestOssPresign(conversationId, item);
+            try {
+                await executeOssUpload(item, presign);
+            } catch (firstError) {
+                if (!shouldFallbackToPost(presign?.method, firstError)) {
+                    throw firstError;
+                }
+                presign = await requestOssPresign(conversationId, item, "POST");
+                await executeOssUpload(item, presign);
+            }
 
             item.status = "processing";
             item.progress = 98;
@@ -1647,7 +1674,7 @@
                     await uploadAttachmentViaOss(item, conversationId);
                 } catch (error) {
                     const canFallback = String(error?.errorCode || "") === "OSS_NOT_CONFIGURED"
-                        || /OSS未配置|直传|presign/i.test(String(error?.message || ""));
+                        || /OSS未配置|直传|presign|OSS上传失败|OSS network error|SignatureDoesNotMatch|403|CORS/i.test(String(error?.message || ""));
                     if (canFallback) {
                         try {
                             await uploadAttachmentViaBackend(item, conversationId);
@@ -1917,6 +1944,12 @@
                         history: Array.isArray(historyMessages) ? historyMessages : []
                     }
                 });
+                if (String(data?.status || "").toLowerCase() === "processing" || data?.errorCode === "ATTACHMENT_PARSING_IN_PROGRESS") {
+                    throw new Error(String(data?.message || "案卷过大，AI 仍在深度阅卷中，请耐心等待 1-2 分钟后再试。"));
+                }
+                if (data?.success === false && data?.message) {
+                    throw new Error(String(data.message));
+                }
                 const reply = typeof data.reply === "string" ? data.reply.trim() : "";
                 if (!reply) {
                     throw new Error("后端返回为空，请稍后重试");

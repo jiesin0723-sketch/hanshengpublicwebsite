@@ -2113,6 +2113,7 @@ async function handleUploadPresign(req, res) {
   }
   const conversationId = normalizeConversationId(req.body?.conversationId);
   const fileName = normalizeFilename(req.body?.fileName || req.body?.name, "附件");
+  const mimeType = normalizeUploadMimeType(req.body?.mimeType, fileName) || "application/octet-stream";
   const fileSize = Number(req.body?.size) || 0;
   if (fileSize <= 0 || fileSize > MAX_BINARY_ATTACHMENT_BYTES) {
     return res.status(400).json({
@@ -2128,12 +2129,17 @@ async function handleUploadPresign(req, res) {
   });
   const policy = buildOssPostPolicy({ objectKey });
   const uploadUrl = getOssUploadBaseUrl();
+  const requestedMethod = String(req.body?.uploadMethod || "").trim().toUpperCase();
+  const effectiveUploadMethod = ["PUT", "POST"].includes(requestedMethod)
+    ? requestedMethod
+    : OSS_UPLOAD_METHOD;
   try {
-    if (OSS_UPLOAD_METHOD === "PUT") {
+    if (effectiveUploadMethod === "PUT") {
       const client = getOssClient();
       const signedPutUrl = client.signatureUrl(objectKey, {
         expires: Math.max(60, OSS_PRESIGN_EXPIRE_SECONDS),
         method: "PUT",
+        "Content-Type": mimeType,
       });
       console.log(
         "上传签名下发:",
@@ -2141,6 +2147,7 @@ async function handleUploadPresign(req, res) {
         `conversation=${conversationId}`,
         `size=${fileSize}`,
         `objectKey=${objectKey}`,
+        `mime=${mimeType}`,
         "method=PUT"
       );
       return res.json({
@@ -2148,7 +2155,9 @@ async function handleUploadPresign(req, res) {
         mode: "oss-direct",
         uploadUrl: signedPutUrl,
         method: "PUT",
-        uploadHeaders: {},
+        uploadHeaders: {
+          "Content-Type": mimeType,
+        },
         objectKey,
         objectUrl: getPublicObjectUrl(objectKey),
         expiresAt: new Date(Date.now() + OSS_PRESIGN_EXPIRE_SECONDS * 1000).toISOString(),
@@ -2178,6 +2187,7 @@ async function handleUploadPresign(req, res) {
     `conversation=${conversationId}`,
     `size=${fileSize}`,
     `objectKey=${objectKey}`,
+    `mime=${mimeType}`,
     "method=POST"
   );
   return res.json({
