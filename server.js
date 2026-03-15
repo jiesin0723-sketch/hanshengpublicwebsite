@@ -2075,6 +2075,11 @@ function buildOssPostPolicy({ objectKey }) {
       ["content-length-range", 1, MAX_BINARY_ATTACHMENT_BYTES],
       { bucket: OSS_BUCKET },
       { key: objectKey },
+      // 🚀 核心修复：必须在条件备案里声明以下字段，否则阿里云会报 403 进而引发 CORS 错误
+      { success_action_status: "200" },
+      ["starts-with", "$name", ""],
+      ["starts-with", "$filename", ""],
+      ["starts-with", "$Content-Type", ""]
     ],
   };
   const policyBase64 = Buffer.from(JSON.stringify(policyObject)).toString("base64");
