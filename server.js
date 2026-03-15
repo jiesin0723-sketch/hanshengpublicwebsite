@@ -249,6 +249,9 @@ const OSS_PRESIGN_EXPIRE_SECONDS = readPositiveInt("OSS_PRESIGN_EXPIRE_SECONDS",
 const OSS_FETCH_TIMEOUT_MS = readPositiveInt("OSS_FETCH_TIMEOUT_MS", 180_000);
 const OSS_FORCE_HTTPS = readBool("OSS_FORCE_HTTPS", true);
 const OSS_PUBLIC_BASE_URL = String(process.env.OSS_PUBLIC_BASE_URL || "").trim();
+const OSS_UPLOAD_METHOD = ["PUT", "POST"].includes(String(process.env.OSS_UPLOAD_METHOD || "PUT").trim().toUpperCase())
+  ? String(process.env.OSS_UPLOAD_METHOD || "PUT").trim().toUpperCase()
+  : "PUT";
 const DOCMIND_ENDPOINT = "docmind-api.cn-hangzhou.aliyuncs.com";
 const DOCMIND_REGION_ID = String(process.env.DOCMIND_REGION_ID || process.env.OCR_REGION_ID || "cn-hangzhou").trim();
 const OSS_SIGNED_URL_EXPIRE_SECONDS = readPositiveInt("OSS_SIGNED_URL_EXPIRE_SECONDS", 3600);
@@ -2125,6 +2128,43 @@ async function handleUploadPresign(req, res) {
   });
   const policy = buildOssPostPolicy({ objectKey });
   const uploadUrl = getOssUploadBaseUrl();
+  try {
+    if (OSS_UPLOAD_METHOD === "PUT") {
+      const client = getOssClient();
+      const signedPutUrl = client.signatureUrl(objectKey, {
+        expires: Math.max(60, OSS_PRESIGN_EXPIRE_SECONDS),
+        method: "PUT",
+      });
+      console.log(
+        "上传签名下发:",
+        `user=${req.authUser.id}`,
+        `conversation=${conversationId}`,
+        `size=${fileSize}`,
+        `objectKey=${objectKey}`,
+        "method=PUT"
+      );
+      return res.json({
+        success: true,
+        mode: "oss-direct",
+        uploadUrl: signedPutUrl,
+        method: "PUT",
+        uploadHeaders: {},
+        objectKey,
+        objectUrl: getPublicObjectUrl(objectKey),
+        expiresAt: new Date(Date.now() + OSS_PRESIGN_EXPIRE_SECONDS * 1000).toISOString(),
+        maxFileSize: MAX_BINARY_ATTACHMENT_BYTES,
+      });
+    }
+  } catch (error) {
+    const detail = normalizeErrorMessage(error);
+    return res.status(500).json({
+      success: false,
+      errorCode: "OSS_PRESIGN_FAILED",
+      message: "OSS 预签名生成失败，请检查 OSS 配置",
+      error: detail,
+    });
+  }
+
   if (!uploadUrl) {
     return res.status(500).json({
       success: false,
@@ -2137,7 +2177,8 @@ async function handleUploadPresign(req, res) {
     `user=${req.authUser.id}`,
     `conversation=${conversationId}`,
     `size=${fileSize}`,
-    `objectKey=${objectKey}`
+    `objectKey=${objectKey}`,
+    "method=POST"
   );
   return res.json({
     success: true,
