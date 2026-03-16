@@ -1483,25 +1483,26 @@
             renderAttachmentList();
         }
 
-        async function requestUploadCompleteWithRetry(payload, maxAttempts = 2) {
+        async function requestUploadCompleteWithRetry(payload, maxAttempts = 3) {
             let lastError = null;
             for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                 try {
                     return await requestBackend("/api/uploads/complete", {
                         method: "POST",
                         requireAuth: true,
-                        timeoutMs: 30_000,
+                        timeoutMs: 60_000,
                         body: payload
                     });
                 } catch (error) {
                     lastError = error;
                     const message = String(error?.message || "");
                     const statusCode = Number(error?.statusCode || 0);
-                    const retryable = attempt < maxAttempts && (statusCode >= 500 || /timeout|network|failed to fetch|load failed/i.test(message));
+                    const retryable = attempt < maxAttempts && (statusCode >= 500 || statusCode === 0 || /timeout|network|failed to fetch|load failed|502|503|504/i.test(message));
+                    console.warn(`[回填重试] attempt=${attempt}/${maxAttempts} retryable=${retryable} status=${statusCode} msg=${message.slice(0, 200)}`);
                     if (!retryable) {
                         throw error;
                     }
-                    await new Promise((resolve) => setTimeout(resolve, 1200 * attempt));
+                    await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
                 }
             }
             throw lastError || new Error("OSS回填失败");
@@ -1576,6 +1577,13 @@
                 throw new Error("未获取到有效的OSS上传签名");
             }
 
+            console.log(
+                `[OSS直传开始] method=${uploadMethod}`,
+                `file=${item.name}`,
+                `size=${item.size}`,
+                `url_prefix=${String(presign.uploadUrl || "").slice(0, 80)}...`
+            );
+
             await new Promise((resolve, reject) => {
                 const xhr = new XMLHttpRequest();
                 xhr.open(uploadMethod, presign.uploadUrl, true);
@@ -1594,13 +1602,26 @@
                 xhr.onload = () => {
                     item.xhr = null;
                     if ([200, 201, 204].includes(xhr.status)) {
+                        console.log(`[OSS直传成功] method=${uploadMethod} file=${item.name}`);
                         resolve();
                         return;
                     }
-                    const ossText = String(xhr.responseText || "").trim().slice(0, 500);
+                    const ossText = String(xhr.responseText || "").trim().slice(0, 800);
+                    console.error(
+                        `[OSS直传失败] method=${uploadMethod} status=${xhr.status}`,
+                        `file=${item.name}`,
+                        `response=${ossText}`
+                    );
                     reject(new Error(`OSS上传失败（${xhr.status}）${ossText ? `：${ossText}` : ""}`));
                 };
-                xhr.onerror = () => reject(new Error("OSS network error（请检查OSS CORS、HTTPS协议与Endpoint）"));
+                xhr.onerror = () => {
+                    console.error(
+                        `[OSS直传网络错误] method=${uploadMethod} file=${item.name}`,
+                        `url_host=${(() => { try { return new URL(presign.uploadUrl).host; } catch { return "?"; } })()}`,
+                        `origin=${window.location.origin}`
+                    );
+                    reject(new Error(`OSS network error（请检查OSS CORS是否放行 ${window.location.origin}）`));
+                };
                 xhr.ontimeout = () => reject(new Error("OSS timeout"));
                 xhr.onabort = () => reject(new Error("OSS aborted"));
 
@@ -1630,19 +1651,34 @@
             const method = String(uploadMethod || "").toUpperCase();
             if (method !== "PUT") return false;
             const message = String(error?.message || "");
-            return /SignatureDoesNotMatch|403|InvalidAccessKeyId|AccessDenied|OSS network error|CORS|Load failed/i.test(message);
+            return /SignatureDoesNotMatch|403|400|InvalidAccessKeyId|AccessDenied|OSS network error|OSS上传失败|CORS|Load failed|Failed to fetch|NetworkError|ERR_/i.test(message);
         }
 
         async function uploadAttachmentViaOss(item, conversationId) {
             let presign = await requestOssPresign(conversationId, item);
+            let uploadOk = false;
+
             try {
                 await executeOssUpload(item, presign);
+                uploadOk = true;
             } catch (firstError) {
-                if (!shouldFallbackToPost(presign?.method, firstError)) {
+                console.warn("[OSS首次上传失败]:", String(firstError?.message || ""));
+                if (shouldFallbackToPost(presign?.method, firstError)) {
+                    try {
+                        presign = await requestOssPresign(conversationId, item, "POST");
+                        await executeOssUpload(item, presign);
+                        uploadOk = true;
+                    } catch (postError) {
+                        console.warn("[POST回退也失败]:", String(postError?.message || ""));
+                        throw postError;
+                    }
+                } else {
                     throw firstError;
                 }
-                presign = await requestOssPresign(conversationId, item, "POST");
-                await executeOssUpload(item, presign);
+            }
+
+            if (!uploadOk) {
+                throw new Error("OSS上传未成功");
             }
 
             item.status = "processing";
@@ -1658,7 +1694,9 @@
                 size: item.size
             });
             if (!completeData?.success || !completeData?.attachment?.id) {
-                throw new Error("OSS回填失败");
+                const errMsg = completeData?.message || completeData?.error || "OSS回填失败";
+                console.error("[OSS回填失败]:", errMsg);
+                throw new Error(errMsg);
             }
             applyUploadSuccess(item, completeData.attachment.id);
         }
@@ -1673,18 +1711,23 @@
                 try {
                     await uploadAttachmentViaOss(item, conversationId);
                 } catch (error) {
-                    const canFallback = String(error?.errorCode || "") === "OSS_NOT_CONFIGURED"
-                        || /OSS未配置|直传|presign|OSS上传失败|OSS network error|SignatureDoesNotMatch|403|CORS/i.test(String(error?.message || ""));
-                    if (canFallback) {
-                        try {
-                            await uploadAttachmentViaBackend(item, conversationId);
-                            return;
-                        } catch (fallbackError) {
-                            setUploadFailed(item, fallbackError?.message || "upload failed");
-                            return;
-                        }
+                    const errorMsg = String(error?.message || "");
+                    const errorCode = String(error?.errorCode || "");
+                    console.warn("[OSS直传失败，尝试回退后端上传]:", errorCode, errorMsg);
+                    const noFallback = /附件类型不支持|不支持的附件|超过.*限制|大小无效/i.test(errorMsg);
+                    if (noFallback) {
+                        setUploadFailed(item, errorMsg);
+                        return;
                     }
-                    setUploadFailed(item, error?.message || "upload failed");
+                    try {
+                        item.status = "uploading";
+                        item.progress = 0;
+                        renderAttachmentList();
+                        await uploadAttachmentViaBackend(item, conversationId);
+                    } catch (fallbackError) {
+                        console.error("[后端上传也失败]:", String(fallbackError?.message || ""));
+                        setUploadFailed(item, fallbackError?.message || errorMsg || "upload failed");
+                    }
                 }
             })();
         }

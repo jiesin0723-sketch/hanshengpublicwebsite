@@ -534,9 +534,25 @@ function clearConversationProgress(userId, conversationId) {
 
 app.disable("x-powered-by");
 app.set("trust proxy", TRUST_PROXY);
+
+const RENDER_EXTERNAL_URL = String(process.env.RENDER_EXTERNAL_URL || "").trim();
+const EFFECTIVE_CORS_ORIGINS = (() => {
+  const origins = [...ALLOWED_CORS_ORIGINS];
+  if (RENDER_EXTERNAL_URL && !origins.includes(RENDER_EXTERNAL_URL)) {
+    origins.push(RENDER_EXTERNAL_URL);
+  }
+  if (origins.length === 0) {
+    origins.push("*");
+  }
+  return origins;
+})();
+if (EFFECTIVE_CORS_ORIGINS.length > 0) {
+  console.log("[CORS允许来源]:", EFFECTIVE_CORS_ORIGINS.join(", "));
+}
+
 const corsOptions = {
   origin(origin, callback) {
-    callback(null, isCorsOriginAllowed(origin, ALLOWED_CORS_ORIGINS));
+    callback(null, isCorsOriginAllowed(origin, EFFECTIVE_CORS_ORIGINS));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
@@ -610,55 +626,79 @@ async function readUtf8TextLimited(filePath, maxChars) {
 async function downloadRemoteFileToTemp({ fileUrl, expectedSize, fileName }) {
   const safeName = sanitizeObjectName(fileName || "file");
   const ext = path.extname(safeName).slice(0, 16);
-  const tempPath = path.join(
-    UPLOAD_TMP_DIR,
-    `remote_${Date.now()}_${crypto.randomBytes(8).toString("hex")}${ext}`
-  );
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), OSS_FETCH_TIMEOUT_MS);
+  const maxRetries = 3;
+  let lastError = null;
 
-  let output;
-  try {
-    const response = await fetch(fileUrl, {
-      method: "GET",
-      signal: controller.signal,
-    });
-    if (!response.ok || !response.body) {
-      throw new Error(`远程文件拉取失败：HTTP ${response.status}`);
-    }
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const tempPath = path.join(
+      UPLOAD_TMP_DIR,
+      `remote_${Date.now()}_${crypto.randomBytes(8).toString("hex")}${ext}`
+    );
+    const perAttemptTimeout = OSS_FETCH_TIMEOUT_MS + (attempt - 1) * 30_000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), perAttemptTimeout);
 
-    output = fs.createWriteStream(tempPath);
-    const reader = response.body.getReader();
-    let total = 0;
-    const maxBytes = Math.max(MAX_BINARY_ATTACHMENT_BYTES, Number(expectedSize) || 0);
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      total += value.byteLength;
-      if (total > maxBytes) {
-        throw new Error(`远程附件超过限制（>${Math.floor(maxBytes / 1024 / 1024)}MB）`);
+    let output;
+    try {
+      console.log(
+        `[远程文件下载] attempt=${attempt}/${maxRetries}`,
+        `url_prefix=${String(fileUrl || "").slice(0, 100)}...`,
+        `timeout=${perAttemptTimeout}ms`
+      );
+      const response = await fetch(fileUrl, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`远程文件拉取失败：HTTP ${response.status}`);
       }
-      if (!output.write(Buffer.from(value))) {
-        await once(output, "drain");
+
+      output = fs.createWriteStream(tempPath);
+      const reader = response.body.getReader();
+      let total = 0;
+      const maxBytes = Math.max(MAX_BINARY_ATTACHMENT_BYTES, Number(expectedSize) || 0);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        total += value.byteLength;
+        if (total > maxBytes) {
+          throw new Error(`远程附件超过限制（>${Math.floor(maxBytes / 1024 / 1024)}MB）`);
+        }
+        if (!output.write(Buffer.from(value))) {
+          await once(output, "drain");
+        }
       }
+      output.end();
+      await once(output, "finish");
+      console.log(`[远程文件下载成功] size=${total} attempt=${attempt}`);
+      return {
+        path: tempPath,
+        size: total,
+      };
+    } catch (error) {
+      lastError = error;
+      if (output && !output.destroyed) {
+        output.destroy();
+      }
+      await safeUnlink(tempPath);
+      const detail = normalizeErrorMessage(error);
+      const isRetryable = /abort|timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|network|socket|EAI_AGAIN/i.test(detail);
+      console.warn(
+        `[远程文件下载失败] attempt=${attempt}/${maxRetries}`,
+        `retryable=${isRetryable}`,
+        `error=${detail}`
+      );
+      if (!isRetryable || attempt >= maxRetries) {
+        throw error;
+      }
+      await sleep(2000 * attempt);
+    } finally {
+      clearTimeout(timeout);
     }
-    output.end();
-    await once(output, "finish");
-    return {
-      path: tempPath,
-      size: total,
-    };
-  } catch (error) {
-    if (output && !output.destroyed) {
-      output.destroy();
-    }
-    await safeUnlink(tempPath);
-    throw error;
-  } finally {
-    clearTimeout(timeout);
   }
+  throw lastError || new Error("远程文件下载失败");
 }
 
 async function parseWordToText(filePath, mimeType) {
@@ -715,13 +755,26 @@ function getOssClient() {
   if (!OSS_BUCKET || !OSS_ACCESS_KEY_ID || !OSS_ACCESS_KEY_SECRET || !OSS_REGION) {
     throw createTaggedError("OSS_NOT_CONFIGURED", "OSS 签名链接生成失败，请检查 OSS 配置。", "", 500);
   }
+  const endpointHost = normalizeHost(OSS_ENDPOINT);
+  const explicitEndpoint = endpointHost
+    ? `${OSS_FORCE_HTTPS ? "https" : "http"}://${endpointHost}`
+    : undefined;
   ossClientInstance = new OSS({
     region: OSS_REGION,
     bucket: OSS_BUCKET,
     accessKeyId: OSS_ACCESS_KEY_ID,
     accessKeySecret: OSS_ACCESS_KEY_SECRET,
     secure: OSS_FORCE_HTTPS,
+    endpoint: explicitEndpoint,
+    authorizationV4: false,
   });
+  console.log(
+    "[OSS客户端初始化]",
+    `region=${OSS_REGION}`,
+    `bucket=${OSS_BUCKET}`,
+    `endpoint=${explicitEndpoint || "(auto)"}`,
+    `secure=${OSS_FORCE_HTTPS}`
+  );
   return ossClientInstance;
 }
 
@@ -2136,45 +2189,59 @@ async function handleUploadPresign(req, res) {
   try {
     if (effectiveUploadMethod === "PUT") {
       const client = getOssClient();
-      const signedPutUrl = client.signatureUrl(objectKey, {
-        expires: Math.max(60, OSS_PRESIGN_EXPIRE_SECONDS),
-        method: "PUT",
-        "Content-Type": mimeType,
-      });
-      console.log(
-        "上传签名下发:",
-        `user=${req.authUser.id}`,
-        `conversation=${conversationId}`,
-        `size=${fileSize}`,
-        `objectKey=${objectKey}`,
-        `mime=${mimeType}`,
-        "method=PUT"
-      );
-      return res.json({
-        success: true,
-        mode: "oss-direct",
-        uploadUrl: signedPutUrl,
-        method: "PUT",
-        uploadHeaders: {
-          "Content-Type": mimeType,
-        },
-        objectKey,
-        objectUrl: getPublicObjectUrl(objectKey),
-        expiresAt: new Date(Date.now() + OSS_PRESIGN_EXPIRE_SECONDS * 1000).toISOString(),
-        maxFileSize: MAX_BINARY_ATTACHMENT_BYTES,
-      });
+      const safeMime = String(mimeType || "application/octet-stream").split(";")[0].trim();
+      let signedPutUrl;
+      try {
+        signedPutUrl = client.signatureUrl(objectKey, {
+          expires: Math.max(60, OSS_PRESIGN_EXPIRE_SECONDS),
+          method: "PUT",
+          "Content-Type": safeMime,
+        });
+      } catch (signError) {
+        console.error(
+          "[PUT签名失败，回退POST]:",
+          normalizeErrorMessage(signError)
+        );
+        signedPutUrl = null;
+      }
+      if (signedPutUrl) {
+        console.log(
+          "上传签名下发:",
+          `user=${req.authUser.id}`,
+          `conversation=${conversationId}`,
+          `size=${fileSize}`,
+          `objectKey=${objectKey}`,
+          `mime=${safeMime}`,
+          "method=PUT",
+          `url_prefix=${signedPutUrl.slice(0, 120)}...`
+        );
+        return res.json({
+          success: true,
+          mode: "oss-direct",
+          uploadUrl: signedPutUrl,
+          method: "PUT",
+          uploadHeaders: {
+            "Content-Type": safeMime,
+          },
+          objectKey,
+          objectUrl: getPublicObjectUrl(objectKey),
+          expiresAt: new Date(Date.now() + OSS_PRESIGN_EXPIRE_SECONDS * 1000).toISOString(),
+          maxFileSize: MAX_BINARY_ATTACHMENT_BYTES,
+        });
+      }
     }
   } catch (error) {
     const detail = normalizeErrorMessage(error);
-    return res.status(500).json({
-      success: false,
-      errorCode: "OSS_PRESIGN_FAILED",
-      message: "OSS 预签名生成失败，请检查 OSS 配置",
-      error: detail,
-    });
+    console.error("[PUT预签名异常，回退POST]:", detail);
   }
 
   if (!uploadUrl) {
+    console.error(
+      "[OSS上传地址为空]:",
+      `OSS_ENDPOINT=${OSS_ENDPOINT}`,
+      `OSS_BUCKET=${OSS_BUCKET}`,
+      `getOssHost=${getOssHost()}`
+    );
     return res.status(500).json({
       success: false,
       errorCode: "OSS_UPLOAD_URL_INVALID",
@@ -2234,6 +2301,15 @@ async function handleUploadComplete(req, res) {
   }
 
   try {
+    console.log(
+      "[上传回填开始]:",
+      `user=${req.authUser.id}`,
+      `conversation=${conversationId}`,
+      `objectKey=${objectKey}`,
+      `fileName=${fileName}`,
+      `mime=${mimeType}`,
+      `size=${expectedSize}`
+    );
     const signedUrl = buildSignedOssReadUrl(objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
     if (!signedUrl) {
       return res.status(500).json({
