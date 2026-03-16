@@ -269,6 +269,17 @@ const OSS_SIGNED_URL_EXPIRE_SECONDS = readPositiveInt("OSS_SIGNED_URL_EXPIRE_SEC
 const OSS_REGION = String(process.env.OSS_REGION || detectOssRegion()).trim();
 const ATTACHMENT_PARSE_BASE_ETA_MS = readPositiveInt("ATTACHMENT_PARSE_BASE_ETA_MS", 180_000);
 const ATTACHMENT_PARSE_MAX_ETA_MS = readPositiveInt("ATTACHMENT_PARSE_MAX_ETA_MS", 20 * 60 * 1000);
+const ATTACHMENT_JOB_MAX_QUEUE = readPositiveInt("ATTACHMENT_JOB_MAX_QUEUE", 200);
+const ATTACHMENT_JOB_MAX_RETRIES = readNonNegativeInt("ATTACHMENT_JOB_MAX_RETRIES", 2);
+const ATTACHMENT_JOB_TTL_MS = readPositiveInt("ATTACHMENT_JOB_TTL_MS", 24 * 60 * 60 * 1000);
+const GEMINI_PDF_MAX_BYTES = readPositiveInt("GEMINI_PDF_MAX_BYTES", 50 * 1024 * 1024);
+const GEMINI_FILE_ACTIVE_POLL_MS = readPositiveInt("GEMINI_FILE_ACTIVE_POLL_MS", 2_000);
+const GEMINI_FILE_ACTIVE_TIMEOUT_MS = readPositiveInt("GEMINI_FILE_ACTIVE_TIMEOUT_MS", 120_000);
+const GEMINI_ATTACHMENT_SUMMARY_TIMEOUT_MS = readPositiveInt("GEMINI_ATTACHMENT_SUMMARY_TIMEOUT_MS", 180_000);
+const SPLIT_WORKER_URL = String(process.env.SPLIT_WORKER_URL || "").trim();
+const SPLIT_WORKER_TOKEN = String(process.env.SPLIT_WORKER_TOKEN || "").trim();
+const SPLIT_WORKER_TIMEOUT_MS = readPositiveInt("SPLIT_WORKER_TIMEOUT_MS", 180_000);
+const SPLIT_WORKER_PART_MAX_BYTES = readPositiveInt("SPLIT_WORKER_PART_MAX_BYTES", 35 * 1024 * 1024);
 
 const DEFAULT_ALLOWED_MODELS = [
   "gemini-3.1-pro-preview",
@@ -504,6 +515,10 @@ const uploadedAttachments = new Map();
 const attachmentMaterializationTasks = new Map();
 const processingFiles = new Map();
 const docMindJobRegistry = new Map();
+const attachmentJobs = new Map();
+const attachmentJobByIdempotency = new Map();
+const attachmentJobQueue = [];
+let attachmentJobRunning = 0;
 const conversationProgress = new Map();
 const UPLOAD_TMP_DIR = path.join(__dirname, ".upload-tmp");
 fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
@@ -1829,6 +1844,10 @@ function createDeferredUploadedAttachmentRecord({
     parseError: "",
     parseAttempts: 0,
     docMindJobId: "",
+    etag: "",
+    jobId: "",
+    idempotencyKey: "",
+    traceId: "",
     parseStartedAt: 0,
     parseFinishedAt: 0,
     contextInjected: false,
@@ -2082,6 +2101,24 @@ async function removeUploadedAttachmentRecord(record, { deleteRemote = true } = 
   if (!record) return false;
   uploadedAttachments.delete(record.id);
   attachmentMaterializationTasks.delete(record.id);
+  if (record.jobId) {
+    const job = getAttachmentJobById(record.jobId);
+    if (job?.attachmentIds instanceof Set) {
+      job.attachmentIds.delete(record.id);
+      updateAttachmentJob(job, { attachmentIds: job.attachmentIds });
+      if (job.attachmentIds.size === 0 && ["queued", "running"].includes(String(job.status || "").toLowerCase())) {
+        updateAttachmentJob(job, {
+          status: "canceled",
+          phase: "canceled",
+          progress: 100,
+          etaSec: 0,
+          finishedAt: nowMs(),
+          errorCode: "ATTACHMENT_DELETED",
+          errorMessage: "附件已删除，任务取消",
+        });
+      }
+    }
+  }
   if (deleteRemote && record.kind === "binary") {
     await deleteGeminiFileByName(record.geminiFileName);
   }
@@ -2195,6 +2232,673 @@ function findUploadedAttachmentByObjectKey({ userId, conversationId, objectKey }
   return null;
 }
 
+function normalizeOssEtag(rawEtag) {
+  return String(rawEtag || "").trim().replace(/^"+|"+$/g, "");
+}
+
+function buildAttachmentIdempotencyKey({ objectKey, size, etag }) {
+  const payload = [
+    String(objectKey || "").trim().replace(/^\/+/, ""),
+    String(Number(size) || 0),
+    normalizeOssEtag(etag),
+  ].join("|");
+  return crypto.createHash("sha256").update(payload).digest("hex");
+}
+
+function nextAttachmentJobId() {
+  return `job_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
+}
+
+function nextTraceId() {
+  return `trace_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+}
+
+function extractProviderRequestId(input) {
+  const text = String(input || "");
+  const match = text.match(/request[\s_-]?id[:=]\s*([A-Za-z0-9-]+)/i);
+  return match?.[1] ? String(match[1]) : "";
+}
+
+function readHeaderValue(headers, name) {
+  if (!headers || !name) return "";
+  const normalized = String(name || "").toLowerCase();
+  if (typeof headers.get === "function") {
+    return String(headers.get(name) || headers.get(normalized) || "").trim();
+  }
+  if (typeof headers === "object") {
+    const direct = headers[name] ?? headers[normalized];
+    if (direct != null) return String(direct).trim();
+  }
+  return "";
+}
+
+function nowMs() {
+  return Date.now();
+}
+
+function updateAttachmentJob(job, patch) {
+  if (!job) return null;
+  const current = attachmentJobs.get(String(job.jobId || "")) || job;
+  const next = {
+    ...current,
+    ...patch,
+    updatedAt: nowMs(),
+  };
+  attachmentJobs.set(next.jobId, next);
+  return next;
+}
+
+function mapJobToAttachmentParseStatus(job) {
+  const status = String(job?.status || "").toLowerCase();
+  if (status === "succeeded") return "ready";
+  if (status === "failed" || status === "canceled") return "failed";
+  if (status === "running") return "processing";
+  return "pending";
+}
+
+function mapJobPhaseToMessage(job) {
+  const phase = String(job?.phase || "").toLowerCase();
+  if (phase === "queued") return "AI后台识别排队中";
+  if (phase === "splitting") return "案卷拆分处理中";
+  if (phase === "uploading_to_gemini") return "正在上传案卷到 Gemini";
+  if (phase === "waiting_file_active") return "正在等待 Gemini 文件激活";
+  if (phase === "summarizing") return "正在生成案卷结构化摘要";
+  if (phase === "answered") return "后台识别完成";
+  return "AI后台深度识别中";
+}
+
+function estimateAttachmentJobEtaSeconds(job) {
+  const status = String(job?.status || "").toLowerCase();
+  if (["succeeded", "failed", "canceled"].includes(status)) return 0;
+  const totalBytes = Math.max(1, Number(job?.size || 0));
+  const estimatedMs = Math.min(
+    ATTACHMENT_PARSE_MAX_ETA_MS,
+    ATTACHMENT_PARSE_BASE_ETA_MS + Math.ceil(totalBytes / 1024 / 1024) * 5_000
+  );
+  const startedAt = Number(job?.startedAt || 0);
+  if (!startedAt) return Math.ceil(estimatedMs / 1000);
+  const remain = Math.max(3_000, estimatedMs - (nowMs() - startedAt));
+  return Math.ceil(remain / 1000);
+}
+
+function getAttachmentJobById(jobId) {
+  return attachmentJobs.get(String(jobId || "").trim()) || null;
+}
+
+function getReusableAttachmentJobByIdempotency(idempotencyKey) {
+  const key = String(idempotencyKey || "").trim();
+  if (!key) return null;
+  const jobId = attachmentJobByIdempotency.get(key);
+  if (!jobId) return null;
+  const job = attachmentJobs.get(jobId);
+  if (!job) {
+    attachmentJobByIdempotency.delete(key);
+    return null;
+  }
+  const status = String(job.status || "").toLowerCase();
+  if (["queued", "running", "succeeded"].includes(status)) {
+    return job;
+  }
+  return null;
+}
+
+function queueAttachmentJob(job) {
+  if (!job) return;
+  const status = String(job.status || "").toLowerCase();
+  if (status === "queued" || status === "running" || status === "succeeded") return;
+  if (attachmentJobQueue.length >= ATTACHMENT_JOB_MAX_QUEUE) {
+    throw createTaggedError(
+      "ATTACHMENT_QUEUE_FULL",
+      "后台任务队列繁忙，请稍后重试",
+      `queue=${attachmentJobQueue.length}`,
+      429
+    );
+  }
+  updateAttachmentJob(job, {
+    status: "queued",
+    phase: "queued",
+    progress: Math.max(1, Number(job.progress || 0)),
+    etaSec: estimateAttachmentJobEtaSeconds(job),
+    errorCode: "",
+    errorMessage: "",
+  });
+  attachmentJobQueue.push(job.jobId);
+  drainAttachmentJobQueue();
+}
+
+function createAttachmentJobForRecord(record, idempotencyKey) {
+  const job = {
+    jobId: nextAttachmentJobId(),
+    traceId: nextTraceId(),
+    idempotencyKey,
+    userId: record.userId,
+    conversationId: record.conversationId,
+    objectKey: record.objectKey,
+    size: Number(record.size) || 0,
+    mimeType: record.mimeType,
+    fileName: record.name,
+    etag: normalizeOssEtag(record.etag),
+    status: "new",
+    phase: "queued",
+    progress: 0,
+    etaSec: estimateAttachmentJobEtaSeconds(record),
+    retries: 0,
+    errorCode: "",
+    errorMessage: "",
+    providerRequestId: "",
+    splitRequestId: "",
+    geminiUploadRequestId: "",
+    geminiGenerateRequestId: "",
+    attachmentIds: new Set([record.id]),
+    createdAt: nowMs(),
+    updatedAt: nowMs(),
+    startedAt: 0,
+    finishedAt: 0,
+    summaryText: "",
+  };
+  attachmentJobs.set(job.jobId, job);
+  attachmentJobByIdempotency.set(idempotencyKey, job.jobId);
+  return job;
+}
+
+function attachRecordToJob(record, job) {
+  if (!record || !job) return;
+  if (!job.attachmentIds || !(job.attachmentIds instanceof Set)) {
+    job.attachmentIds = new Set();
+  }
+  job.attachmentIds.add(record.id);
+  record.jobId = job.jobId;
+  record.idempotencyKey = job.idempotencyKey;
+  record.traceId = job.traceId;
+  const parseStatus = mapJobToAttachmentParseStatus(job);
+  record.parseStatus = parseStatus;
+  record.parseMessage = mapJobPhaseToMessage(job);
+  record.parseError = String(job.errorMessage || "");
+  record.parseStartedAt = Number(job.startedAt || record.parseStartedAt || 0);
+  record.parseFinishedAt = Number(job.finishedAt || record.parseFinishedAt || 0);
+  record.expiresAt = nowMs() + UPLOAD_ATTACHMENT_TTL_MS;
+  uploadedAttachments.set(record.id, record);
+}
+
+async function requestSplitWorkerForPdf({ record, traceId }) {
+  if (!SPLIT_WORKER_URL) {
+    throw createTaggedError(
+      "SPLIT_WORKER_NOT_CONFIGURED",
+      "超大 PDF 需要拆分处理，请联系管理员配置拆分服务",
+      "missing SPLIT_WORKER_URL",
+      500
+    );
+  }
+  const signedUrl = buildSignedOssReadUrl(record.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SPLIT_WORKER_TIMEOUT_MS);
+  try {
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Trace-Id": traceId,
+    };
+    if (SPLIT_WORKER_TOKEN) {
+      headers.Authorization = `Bearer ${SPLIT_WORKER_TOKEN}`;
+    }
+    const response = await fetch(SPLIT_WORKER_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        objectKey: record.objectKey,
+        fileName: record.name,
+        mimeType: record.mimeType,
+        size: Number(record.size) || 0,
+        signedUrl,
+        maxPartBytes: SPLIT_WORKER_PART_MAX_BYTES,
+      }),
+      signal: controller.signal,
+    });
+    const rawText = await response.text();
+    let data = {};
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      data = {};
+    }
+    if (!response.ok) {
+      const detail = String(data?.message || rawText || `split-worker-http-${response.status}`).slice(0, 2000);
+      throw createTaggedError(
+        "SPLIT_WORKER_FAILED",
+        "案卷拆分失败，请稍后重试",
+        detail,
+        502
+      );
+    }
+    const splitRequestId = String(
+      data?.requestId
+      || response.headers.get("x-request-id")
+      || response.headers.get("x-acs-request-id")
+      || ""
+    ).trim();
+    const rawParts = Array.isArray(data?.parts) ? data.parts : [];
+    const normalizedParts = rawParts
+      .map((part, index) => ({
+        objectKey: String(part?.objectKey || "").trim().replace(/^\/+/, ""),
+        size: Number(part?.size) > 0 ? Number(part.size) : 0,
+        fileName: normalizeFilename(part?.fileName || `${record.name}_part_${index + 1}.pdf`, `${record.name}_part_${index + 1}.pdf`),
+      }))
+      .filter((part) => Boolean(part.objectKey));
+    if (normalizedParts.length === 0) {
+      throw createTaggedError(
+        "SPLIT_WORKER_EMPTY_PARTS",
+        "案卷拆分失败，请稍后重试",
+        "split worker returned empty parts",
+        502
+      );
+    }
+    return {
+      splitRequestId,
+      parts: normalizedParts,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function waitGeminiFileActive(fileName, traceId) {
+  if (!fileName || typeof ai?.files?.get !== "function") {
+    return;
+  }
+  const startedAt = nowMs();
+  while (nowMs() - startedAt < GEMINI_FILE_ACTIVE_TIMEOUT_MS) {
+    const file = await ai.files.get({ name: fileName });
+    const stateRaw = String(
+      file?.state?.name
+      || file?.state
+      || file?.status
+      || ""
+    ).toUpperCase();
+    if (!stateRaw || stateRaw === "ACTIVE" || stateRaw === "READY") {
+      return;
+    }
+    if (stateRaw === "FAILED" || stateRaw === "ERROR") {
+      throw createTaggedError(
+        "GEMINI_FILE_PROCESS_FAILED",
+        "Gemini 文件处理失败",
+        `traceId=${traceId} fileName=${fileName} state=${stateRaw}`,
+        502
+      );
+    }
+    await sleep(GEMINI_FILE_ACTIVE_POLL_MS);
+  }
+  throw createTaggedError(
+    "GEMINI_FILE_ACTIVE_TIMEOUT",
+    "Gemini 文件激活超时，请稍后重试",
+    `traceId=${traceId} fileName=${fileName}`,
+    504
+  );
+}
+
+async function summarizeGeminiFilePart({
+  model,
+  fileUri,
+  mimeType,
+  partIndex,
+  totalParts,
+  traceId,
+}) {
+  const response = await withTimeout(
+    ai.models.generateContent({
+      model,
+      contents: [{
+        role: "user",
+        parts: [
+          {
+            text: `你是一名资深法律助理。请对当前案卷分片（${partIndex}/${totalParts}）生成结构化摘要，重点保留：事实时间轴、关键金额、关键主体、争议焦点、可用于法庭的证据线索。禁止编造。`,
+          },
+          {
+            fileData: {
+              fileUri,
+              mimeType,
+            },
+          },
+        ],
+      }],
+      config: {
+        temperature: 0.1,
+        topP: 0.8,
+        topK: 40,
+      },
+    }),
+    GEMINI_ATTACHMENT_SUMMARY_TIMEOUT_MS
+  );
+  const summary = String(response?.text || "").trim();
+  if (!summary) {
+    throw createTaggedError(
+      "GEMINI_PART_SUMMARY_EMPTY",
+      "案卷分片摘要为空",
+      `traceId=${traceId} part=${partIndex}`,
+      502
+    );
+  }
+  const requestId = String(
+    readHeaderValue(response?.response?.headers, "x-request-id")
+    || readHeaderValue(response?.response?.headers, "x-acs-request-id")
+    || extractProviderRequestId(response?.response?.requestId)
+  ).trim();
+  return {
+    summary,
+    requestId,
+  };
+}
+
+async function mergeGeminiPartSummaries({ model, summaries, traceId }) {
+  if (!Array.isArray(summaries) || summaries.length === 0) {
+    return {
+      text: "",
+      requestId: "",
+    };
+  }
+  if (summaries.length === 1) {
+    return {
+      text: String(summaries[0] || ""),
+      requestId: "",
+    };
+  }
+  const mergedInput = summaries
+    .map((item, idx) => `【分片${idx + 1}摘要】\n${String(item || "")}`)
+    .join("\n\n");
+  const response = await withTimeout(
+    ai.models.generateContent({
+      model,
+      contents: [{
+        role: "user",
+        parts: [{
+          text: `请将以下多个案卷分片摘要合并成一份完整案卷摘要，要求：去重、保留金额和时间细节、保留主体关系、形成可用于后续问答的事实基础。\n\n${mergedInput}`,
+        }],
+      }],
+      config: {
+        temperature: 0.1,
+        topP: 0.8,
+        topK: 40,
+      },
+    }),
+    GEMINI_ATTACHMENT_SUMMARY_TIMEOUT_MS
+  );
+  const text = String(response?.text || "").trim();
+  if (!text) {
+    throw createTaggedError(
+      "GEMINI_SUMMARY_MERGE_EMPTY",
+      "案卷摘要汇总失败",
+      `traceId=${traceId}`,
+      502
+    );
+  }
+  const requestId = String(
+    readHeaderValue(response?.response?.headers, "x-request-id")
+    || readHeaderValue(response?.response?.headers, "x-acs-request-id")
+    || extractProviderRequestId(response?.response?.requestId)
+  ).trim();
+  return {
+    text,
+    requestId,
+  };
+}
+
+function collectJobAttachmentRecords(job) {
+  const records = [];
+  for (const attachmentId of job?.attachmentIds || []) {
+    const record = uploadedAttachments.get(String(attachmentId || ""));
+    if (!record) continue;
+    records.push(record);
+  }
+  return records;
+}
+
+function markJobFailed(job, error) {
+  const detail = normalizeErrorMessage(error);
+  const errorCode = String(error?.code || "ATTACHMENT_JOB_FAILED").trim() || "ATTACHMENT_JOB_FAILED";
+  const providerRequestId = extractProviderRequestId(detail);
+  updateAttachmentJob(job, {
+    status: "failed",
+    phase: "failed",
+    progress: 100,
+    etaSec: 0,
+    finishedAt: nowMs(),
+    errorCode,
+    errorMessage: detail,
+    providerRequestId: providerRequestId || String(job.providerRequestId || ""),
+  });
+  const records = collectJobAttachmentRecords(job);
+  for (const record of records) {
+    record.parseStatus = "failed";
+    record.parseMessage = "后台识别失败";
+    record.parseError = detail;
+    record.parseFinishedAt = nowMs();
+    record.expiresAt = nowMs() + UPLOAD_ATTACHMENT_TTL_MS;
+    uploadedAttachments.set(record.id, record);
+  }
+}
+
+async function executeAttachmentJob(job) {
+  const model = DEFAULT_MODEL;
+  updateAttachmentJob(job, {
+    status: "running",
+    phase: "splitting",
+    progress: 5,
+    startedAt: job.startedAt || nowMs(),
+    etaSec: estimateAttachmentJobEtaSeconds(job),
+    errorCode: "",
+    errorMessage: "",
+  });
+
+  const records = collectJobAttachmentRecords(job);
+  const primaryRecord = records[0];
+  if (!primaryRecord) {
+    throw createTaggedError("ATTACHMENT_RECORD_MISSING", "附件记录不存在或已过期", job.jobId, 404);
+  }
+  const isPdf = String(primaryRecord.mimeType || "").toLowerCase() === "application/pdf";
+  let parts = [{
+    objectKey: primaryRecord.objectKey,
+    size: Number(primaryRecord.size) || 0,
+    fileName: primaryRecord.name,
+  }];
+  if (isPdf && Number(primaryRecord.size || 0) > GEMINI_PDF_MAX_BYTES) {
+    const split = await requestSplitWorkerForPdf({
+      record: primaryRecord,
+      traceId: job.traceId,
+    });
+    updateAttachmentJob(job, {
+      splitRequestId: String(split.splitRequestId || ""),
+      providerRequestId: String(split.splitRequestId || job.providerRequestId || ""),
+    });
+    parts = split.parts;
+  }
+
+  const summaries = [];
+  let partCounter = 0;
+  for (const part of parts) {
+    partCounter += 1;
+    updateAttachmentJob(job, {
+      phase: "uploading_to_gemini",
+      progress: Math.min(90, 10 + Math.floor((partCounter / parts.length) * 70)),
+      etaSec: estimateAttachmentJobEtaSeconds(job),
+    });
+    const signedUrl = buildSignedOssReadUrl(part.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
+    const downloaded = await downloadRemoteFileToTemp({
+      fileUrl: signedUrl,
+      expectedSize: part.size || primaryRecord.size,
+      fileName: part.fileName || primaryRecord.name,
+    });
+    let geminiFileName = "";
+    try {
+      const uploaded = await withTimeout(
+        ai.files.upload({
+          file: downloaded.path,
+          config: {
+            mimeType: primaryRecord.mimeType || "application/pdf",
+            displayName: normalizeFilename(part.fileName || primaryRecord.name, "attachment.pdf"),
+          },
+        }),
+        GEMINI_ATTACHMENT_SUMMARY_TIMEOUT_MS
+      );
+      const uploadRequestId = String(
+        readHeaderValue(uploaded?.response?.headers, "x-request-id")
+        || readHeaderValue(uploaded?.response?.headers, "x-acs-request-id")
+        || extractProviderRequestId(uploaded?.response?.requestId)
+      ).trim();
+      if (uploadRequestId) {
+        updateAttachmentJob(job, {
+          geminiUploadRequestId: uploadRequestId,
+          providerRequestId: uploadRequestId,
+        });
+      }
+      const fileUri = String(uploaded?.uri || "").trim();
+      geminiFileName = String(uploaded?.name || "").trim();
+      if (!fileUri || !geminiFileName) {
+        throw createTaggedError(
+          "GEMINI_FILE_UPLOAD_EMPTY",
+          "Gemini 文件上传失败",
+          `traceId=${job.traceId} part=${partCounter}`,
+          502
+        );
+      }
+
+      updateAttachmentJob(job, {
+        phase: "waiting_file_active",
+      });
+      await waitGeminiFileActive(geminiFileName, job.traceId);
+
+      updateAttachmentJob(job, {
+        phase: "summarizing",
+      });
+      const partSummary = await summarizeGeminiFilePart({
+        model,
+        fileUri,
+        mimeType: primaryRecord.mimeType || "application/pdf",
+        partIndex: partCounter,
+        totalParts: parts.length,
+        traceId: job.traceId,
+      });
+      summaries.push(partSummary.summary);
+      if (partSummary.requestId) {
+        updateAttachmentJob(job, {
+          geminiGenerateRequestId: partSummary.requestId,
+          providerRequestId: partSummary.requestId,
+        });
+      }
+    } finally {
+      await safeUnlink(downloaded.path);
+      if (geminiFileName) {
+        await deleteGeminiFileByName(geminiFileName);
+      }
+    }
+  }
+
+  const mergedSummary = await mergeGeminiPartSummaries({
+    model,
+    summaries,
+    traceId: job.traceId,
+  });
+  if (mergedSummary.requestId) {
+    updateAttachmentJob(job, {
+      geminiGenerateRequestId: mergedSummary.requestId,
+      providerRequestId: mergedSummary.requestId,
+    });
+  }
+  const safeSummary = String(mergedSummary.text || "").slice(0, FINANCIAL_DATA_MAX_CHARS);
+  updateAttachmentJob(job, {
+    status: "succeeded",
+    phase: "answered",
+    progress: 100,
+    etaSec: 0,
+    finishedAt: nowMs(),
+    summaryText: safeSummary,
+    errorCode: "",
+    errorMessage: "",
+  });
+
+  for (const record of records) {
+    const materialized = {
+      ...record,
+      kind: "text",
+      mimeType: "text/plain",
+      text: safeSummary,
+      textLimit: FINANCIAL_DATA_MAX_CHARS,
+      isFinancialData: false,
+      usedChunkSummary: false,
+      parseStatus: "ready",
+      parseMessage: "后台识别完成",
+      parseError: "",
+      parseFinishedAt: nowMs(),
+      expiresAt: nowMs() + UPLOAD_ATTACHMENT_TTL_MS,
+    };
+    uploadedAttachments.set(materialized.id, materialized);
+    appendBackgroundAttachmentContext(materialized);
+  }
+}
+
+async function runAttachmentJob(jobId) {
+  const job = getAttachmentJobById(jobId);
+  if (!job) return;
+  if (String(job.status || "").toLowerCase() === "canceled") return;
+  for (let attempt = Number(job.retries || 0); attempt <= ATTACHMENT_JOB_MAX_RETRIES; attempt += 1) {
+    try {
+      updateAttachmentJob(job, { retries: attempt });
+      await executeAttachmentJob(job);
+      return;
+    } catch (error) {
+      const retryable = attempt < ATTACHMENT_JOB_MAX_RETRIES && isTransientError(error);
+      if (!retryable) {
+        markJobFailed(job, error);
+        return;
+      }
+      const waitMs = 1500 * (attempt + 1);
+      updateAttachmentJob(job, {
+        phase: "queued",
+        status: "running",
+        errorCode: "",
+        errorMessage: "",
+      });
+      await sleep(waitMs);
+    }
+  }
+}
+
+function drainAttachmentJobQueue() {
+  if (attachmentJobRunning >= 1) return;
+  while (attachmentJobQueue.length > 0 && attachmentJobRunning < 1) {
+    const nextJobId = String(attachmentJobQueue.shift() || "");
+    const job = getAttachmentJobById(nextJobId);
+    if (!job) continue;
+    if (String(job.status || "").toLowerCase() !== "queued") continue;
+    attachmentJobRunning += 1;
+    runAttachmentJob(nextJobId)
+      .catch((error) => {
+        markJobFailed(job, error);
+      })
+      .finally(() => {
+        attachmentJobRunning = Math.max(0, attachmentJobRunning - 1);
+        drainAttachmentJobQueue();
+      });
+  }
+}
+
+function ensureAttachmentJobForRecord(record) {
+  const idempotencyKey = buildAttachmentIdempotencyKey({
+    objectKey: record.objectKey,
+    size: record.size,
+    etag: record.etag || "",
+  });
+  let job = getReusableAttachmentJobByIdempotency(idempotencyKey);
+  if (!job) {
+    job = createAttachmentJobForRecord(record, idempotencyKey);
+  }
+  attachRecordToJob(record, job);
+  const status = String(job.status || "").toLowerCase();
+  if (status !== "succeeded" && status !== "running" && status !== "queued") {
+    queueAttachmentJob(job);
+  } else if (status === "running" || status === "queued") {
+    drainAttachmentJobQueue();
+  }
+  return job;
+}
+
 function estimateAttachmentParseBudgetMs(record) {
   const sizeBytes = Math.max(0, Number(record?.size || 0));
   const sizeMb = Math.max(1, Math.ceil(sizeBytes / 1024 / 1024));
@@ -2237,6 +2941,11 @@ function computeAttachmentProgressPercent(record) {
 
 function mapUploadedAttachmentStatus(record) {
   if (!record) return null;
+  const job = record.jobId ? getAttachmentJobById(record.jobId) : null;
+  const jobParseStatus = job ? mapJobToAttachmentParseStatus(job) : "";
+  const jobMessage = job ? mapJobPhaseToMessage(job) : "";
+  const jobEta = job ? estimateAttachmentJobEtaSeconds(job) : 0;
+  const jobProgress = job ? Math.max(1, Math.min(100, Number(job.progress || 0))) : 0;
   const base = {
     id: record.id,
     name: record.name,
@@ -2259,10 +2968,12 @@ function mapUploadedAttachmentStatus(record) {
       parseError: "",
       etaSeconds: 0,
       progressPercent: 100,
+      jobId: String(record.jobId || ""),
+      providerRequestId: String(job?.providerRequestId || ""),
     };
   }
 
-  const parseStatus = String(record.parseStatus || "pending").toLowerCase();
+  const parseStatus = String(jobParseStatus || record.parseStatus || "pending").toLowerCase();
   const fallbackMessage = parseStatus === "ready"
     ? "后台识别完成"
     : parseStatus === "failed"
@@ -2274,12 +2985,14 @@ function mapUploadedAttachmentStatus(record) {
   return {
     ...base,
     parseStatus,
-    parseMessage: String(record.parseMessage || fallbackMessage),
-    parseError: String(record.parseError || ""),
-    etaSeconds: computeAttachmentParseEtaSeconds(record),
-    progressPercent: computeAttachmentProgressPercent(record),
+    parseMessage: String(jobMessage || record.parseMessage || fallbackMessage),
+    parseError: String(job?.errorMessage || record.parseError || ""),
+    etaSeconds: Number(job ? jobEta : computeAttachmentParseEtaSeconds(record)),
+    progressPercent: Number(job ? jobProgress : computeAttachmentProgressPercent(record)),
     parseStartedAt: Number(record.parseStartedAt || 0),
     parseFinishedAt: Number(record.parseFinishedAt || 0),
+    jobId: String(record.jobId || ""),
+    providerRequestId: String(job?.providerRequestId || ""),
   };
 }
 
@@ -2378,99 +3091,39 @@ function appendBackgroundAttachmentContext(record) {
 function scheduleAttachmentMaterialization(record) {
   if (!record || record.kind !== "remote") return;
   const current = uploadedAttachments.get(record.id) || record;
-  if (attachmentMaterializationTasks.has(current.id)) return;
   if (current.kind !== "remote") return;
-  if (["ready", "failed"].includes(String(current.parseStatus || "").toLowerCase())) return;
-  if (current.parseStatus === "processing") return;
-  const objectKey = String(current.objectKey || "").trim();
-  if (objectKey && processingFiles.has(objectKey)) {
-    current.parseStatus = "processing";
-    current.parseMessage = "AI后台深度识别中";
-    current.parseError = "";
-    current.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
-    uploadedAttachments.set(current.id, current);
-    return;
-  }
+  const parseStatus = String(current.parseStatus || "").toLowerCase();
+  if (parseStatus === "ready") return;
 
-  current.parseStatus = "processing";
-  current.parseMessage = "AI后台深度识别中";
-  current.parseError = "";
-  current.parseStartedAt = Date.now();
-  current.parseFinishedAt = 0;
-  current.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
-  uploadedAttachments.set(current.id, current);
-
-  const task = (async () => {
-    try {
-      const materialized = await materializeUploadedAttachmentRecord(current, null);
-      if (!uploadedAttachments.has(current.id)) {
-        return;
-      }
-      materialized.parseStatus = "ready";
-      materialized.parseMessage = "后台识别完成";
-      materialized.parseError = "";
-      materialized.parseFinishedAt = Date.now();
-      materialized.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
-      uploadedAttachments.set(materialized.id, materialized);
-      appendBackgroundAttachmentContext(materialized);
-    } catch (error) {
-      const latest = uploadedAttachments.get(current.id) || current;
-      if (!uploadedAttachments.has(current.id)) {
-        return;
-      }
-      const errorCode = String(error?.code || "").trim();
-      if (errorCode === "DOCMIND_POLL_TIMEOUT") {
-        const nextAttempts = Number(latest.parseAttempts || 0) + 1;
-        const timeoutJobId = String(error?.jobId || latest.docMindJobId || "").trim();
-        latest.parseStatus = "pending";
-        latest.parseMessage = "案卷较大，后台识别时间较长，系统将继续处理";
-        latest.parseError = "";
-        latest.parseAttempts = nextAttempts;
-        latest.docMindJobId = timeoutJobId;
-        latest.parseFinishedAt = 0;
-        latest.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
-        uploadedAttachments.set(latest.id, latest);
-        console.warn(
-          "后台案卷识别超时，进入续轮询:",
-          `user=${latest.userId}`,
-          `conversation=${latest.conversationId}`,
-          `attachment=${latest.id}`,
-          `jobId=${timeoutJobId || "(missing)"}`,
-          `attempt=${nextAttempts}/${DOCMIND_TIMEOUT_RETRY_LIMIT}`
-        );
-        if (nextAttempts <= DOCMIND_TIMEOUT_RETRY_LIMIT) {
-          setTimeout(() => {
-            const latestRecord = uploadedAttachments.get(latest.id);
-            if (!latestRecord || latestRecord.kind !== "remote") return;
-            scheduleAttachmentMaterialization(latestRecord);
-          }, DOCMIND_TIMEOUT_RETRY_DELAY_MS);
-          return;
-        }
-      }
-      latest.parseStatus = "failed";
-      latest.parseMessage = "后台识别失败";
-      latest.parseError = normalizeErrorMessage(error);
-      latest.parseFinishedAt = Date.now();
-      latest.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
-      uploadedAttachments.set(latest.id, latest);
-      console.error(
-        "后台案卷识别失败:",
-        `user=${latest.userId}`,
-        `conversation=${latest.conversationId}`,
-        `attachment=${latest.id}`,
-        latest.parseError
-      );
-    } finally {
-      attachmentMaterializationTasks.delete(current.id);
-      if (objectKey) {
-        processingFiles.delete(objectKey);
+  try {
+    const job = ensureAttachmentJobForRecord(current);
+    attachRecordToJob(current, job);
+    if (String(job.status || "").toLowerCase() === "succeeded" && String(current.kind || "") === "remote") {
+      const summaryText = String(job.summaryText || "").trim();
+      if (summaryText) {
+        const materialized = {
+          ...current,
+          kind: "text",
+          mimeType: "text/plain",
+          text: summaryText.slice(0, FINANCIAL_DATA_MAX_CHARS),
+          textLimit: FINANCIAL_DATA_MAX_CHARS,
+          parseStatus: "ready",
+          parseMessage: "后台识别完成",
+          parseError: "",
+          parseFinishedAt: nowMs(),
+          expiresAt: nowMs() + UPLOAD_ATTACHMENT_TTL_MS,
+        };
+        uploadedAttachments.set(materialized.id, materialized);
+        appendBackgroundAttachmentContext(materialized);
       }
     }
-  })();
-
-  attachmentMaterializationTasks.set(current.id, task);
-  if (objectKey) {
-    processingFiles.set(objectKey, true);
+  } catch (error) {
+    current.parseStatus = "failed";
+    current.parseMessage = "后台识别失败";
+    current.parseError = normalizeErrorMessage(error);
+    current.parseFinishedAt = nowMs();
+    current.expiresAt = nowMs() + UPLOAD_ATTACHMENT_TTL_MS;
+    uploadedAttachments.set(current.id, current);
   }
 }
 
@@ -2502,6 +3155,18 @@ async function handleUploadAttachment(req, res) {
     return res.status(400).json({
       success: false,
       message: "未检测到附件文件，请重新上传",
+    });
+  }
+
+  // When OSS direct upload is enabled, keep this endpoint as compatibility-only.
+  // Large files must use STS multipart + /api/uploads/complete async pipeline
+  // to avoid Render memory pressure.
+  if (hasOssCredentials()) {
+    await safeUnlink(req.file.path);
+    return res.status(400).json({
+      success: false,
+      errorCode: "USE_OSS_ASYNC_UPLOAD",
+      message: "当前环境已启用 OSS 直传，请使用 STS 分片上传通道",
     });
   }
 
@@ -2773,6 +3438,7 @@ async function handleUploadComplete(req, res) {
   const fileName = normalizeFilename(req.body?.fileName || req.body?.name, path.basename(objectKey) || "附件");
   const mimeType = normalizeUploadMimeType(req.body?.mimeType, fileName);
   const expectedSize = Number(req.body?.size) || 0;
+  const etag = normalizeOssEtag(req.body?.etag || req.body?.eTag || req.body?.ETag || "");
 
   if (!objectKey) {
     return res.status(400).json({
@@ -2797,7 +3463,8 @@ async function handleUploadComplete(req, res) {
       `objectKey=${objectKey}`,
       `fileName=${fileName}`,
       `mime=${mimeType}`,
-      `size=${expectedSize}`
+      `size=${expectedSize}`,
+      `etag=${etag || "(empty)"}`
     );
     const signedUrl = buildSignedOssReadUrl(objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
     if (!signedUrl) {
@@ -2814,22 +3481,32 @@ async function handleUploadComplete(req, res) {
     });
     if (existingRecord) {
       existingRecord.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+      if (etag) {
+        existingRecord.etag = etag;
+      }
       if (existingRecord.kind === "remote") {
         scheduleAttachmentMaterialization(existingRecord);
       }
       const statusPayload = mapUploadedAttachmentStatus(existingRecord);
-      const parseStatus = String(existingRecord.parseStatus || "").toLowerCase();
+      const parseStatus = String(statusPayload?.parseStatus || existingRecord.parseStatus || "").toLowerCase();
       const message = parseStatus === "ready"
         ? "案卷已在后台识别完成，可直接提问。"
         : parseStatus === "failed"
         ? "案卷后台识别失败，请重新上传或截取关键页后重试。"
         : "案卷已接收，AI 正在后台深度识别中，请稍候提问...";
+      const responseStatus = parseStatus === "ready"
+        ? "ready"
+        : parseStatus === "failed"
+        ? "failed"
+        : "queued";
       uploadedAttachments.set(existingRecord.id, existingRecord);
       return res.json({
-        status: "success",
+        status: responseStatus,
         success: true,
         message,
         url: signedUrl,
+        attachmentId: existingRecord.id,
+        jobId: String(statusPayload?.jobId || existingRecord.jobId || ""),
         attachment: {
           id: existingRecord.id,
           name: existingRecord.name,
@@ -2842,6 +3519,8 @@ async function handleUploadComplete(req, res) {
           parseMessage: statusPayload?.parseMessage || "",
           etaSeconds: Number(statusPayload?.etaSeconds || 0),
           progressPercent: Number(statusPayload?.progressPercent || 0),
+          jobId: String(statusPayload?.jobId || existingRecord.jobId || ""),
+          providerRequestId: String(statusPayload?.providerRequestId || ""),
         },
       });
     }
@@ -2853,15 +3532,24 @@ async function handleUploadComplete(req, res) {
       mimeType,
       size: expectedSize,
     });
+    record.etag = etag;
     uploadedAttachments.set(record.id, record);
     scheduleAttachmentMaterialization(record);
     const statusPayload = mapUploadedAttachmentStatus(record);
+    const parseStatus = String(statusPayload?.parseStatus || "").toLowerCase();
+    const responseStatus = parseStatus === "ready"
+      ? "ready"
+      : parseStatus === "failed"
+      ? "failed"
+      : "queued";
 
     return res.json({
-      status: "success",
+      status: responseStatus,
       success: true,
       message: "案卷已接收，AI 正在后台深度识别中，请稍候提问...",
       url: signedUrl,
+      attachmentId: record.id,
+      jobId: String(statusPayload?.jobId || record.jobId || ""),
       attachment: {
         id: record.id,
         name: record.name,
@@ -2874,6 +3562,8 @@ async function handleUploadComplete(req, res) {
         parseMessage: statusPayload?.parseMessage || "",
         etaSeconds: Number(statusPayload?.etaSeconds || 0),
         progressPercent: Number(statusPayload?.progressPercent || 0),
+        jobId: String(statusPayload?.jobId || record.jobId || ""),
+        providerRequestId: String(statusPayload?.providerRequestId || ""),
       },
     });
   } catch (error) {
@@ -2967,6 +3657,57 @@ async function handleUploadStatus(req, res) {
   });
 }
 
+function serializeAttachmentJob(job) {
+  if (!job) return null;
+  return {
+    jobId: job.jobId,
+    traceId: job.traceId,
+    idempotencyKey: job.idempotencyKey,
+    status: String(job.status || ""),
+    phase: String(job.phase || ""),
+    progress: Number(job.progress || 0),
+    etaSec: Number(estimateAttachmentJobEtaSeconds(job) || 0),
+    retries: Number(job.retries || 0),
+    errorCode: String(job.errorCode || ""),
+    errorMessage: String(job.errorMessage || ""),
+    providerRequestId: String(job.providerRequestId || ""),
+    splitRequestId: String(job.splitRequestId || ""),
+    geminiUploadRequestId: String(job.geminiUploadRequestId || ""),
+    geminiGenerateRequestId: String(job.geminiGenerateRequestId || ""),
+    createdAt: Number(job.createdAt || 0),
+    updatedAt: Number(job.updatedAt || 0),
+    startedAt: Number(job.startedAt || 0),
+    finishedAt: Number(job.finishedAt || 0),
+  };
+}
+
+function handleUploadJobStatus(req, res) {
+  const jobId = String(req.query?.jobId || "").trim();
+  if (!jobId) {
+    return res.status(400).json({
+      success: false,
+      message: "jobId 不能为空",
+    });
+  }
+  const job = getAttachmentJobById(jobId);
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      message: "任务不存在或已过期",
+    });
+  }
+  if (job.userId !== req.authUser.id) {
+    return res.status(403).json({
+      success: false,
+      message: "无权访问该任务",
+    });
+  }
+  return res.json({
+    success: true,
+    job: serializeAttachmentJob(job),
+  });
+}
+
 setInterval(() => {
   const now = Date.now();
 
@@ -3006,6 +3747,21 @@ setInterval(() => {
     const expired = updatedAt > 0 && updatedAt + UPLOAD_ATTACHMENT_TTL_MS <= now;
     if (!activeObjectKeys.has(objectKey) || expired) {
       docMindJobRegistry.delete(objectKey);
+    }
+  }
+
+  for (const [jobId, job] of attachmentJobs.entries()) {
+    const updatedAt = Number(job?.updatedAt || 0);
+    const status = String(job?.status || "").toLowerCase();
+    const active = status === "queued" || status === "running";
+    const expired = updatedAt > 0 && updatedAt + ATTACHMENT_JOB_TTL_MS <= now;
+    if (!active && expired) {
+      attachmentJobs.delete(jobId);
+    }
+  }
+  for (const [idempotencyKey, jobId] of attachmentJobByIdempotency.entries()) {
+    if (!attachmentJobs.has(jobId)) {
+      attachmentJobByIdempotency.delete(idempotencyKey);
     }
   }
 }, 30_000).unref();
@@ -3119,6 +3875,7 @@ app.post("/api/uploads/sts", requireAuth, handleUploadSts);
 app.post("/api/uploads/presign", requireAuth, handleUploadPresign);
 app.post("/api/uploads/complete", requireAuth, handleUploadComplete);
 app.post("/api/uploads/status", requireAuth, handleUploadStatus);
+app.get("/api/uploads/job-status", requireAuth, handleUploadJobStatus);
 app.post("/api/uploads", requireAuth, uploadSingleFileMiddleware, handleUploadAttachment);
 
 app.post("/api/uploads/delete", requireAuth, async (req, res) => {
@@ -3862,23 +4619,29 @@ async function handleChat(req, res) {
     const remoteRecords = uploaded.resolved.filter((record) => record?.kind === "remote");
     if (remoteRecords.length > 0) {
       remoteRecords.forEach((record) => scheduleAttachmentMaterialization(record));
-      const failedRecord = remoteRecords.find((record) => String(record?.parseStatus || "").toLowerCase() === "failed");
+      const failedRecord = remoteRecords.find((record) => {
+        const statusPayload = mapUploadedAttachmentStatus(record);
+        return String(statusPayload?.parseStatus || record?.parseStatus || "").toLowerCase() === "failed";
+      });
       if (failedRecord) {
+        const failedStatus = mapUploadedAttachmentStatus(failedRecord);
         clearConversationProgress(req.authUser.id, conversationId);
         return res.status(502).json({
           status: "error",
           success: false,
           errorCode: "ATTACHMENT_PROCESSING_FAILED",
           message: "读取云端案卷失败，请重试或截取关键页上传",
-          error: String(failedRecord.parseError || failedRecord.parseMessage || "background parsing failed"),
+          error: String(failedStatus?.parseError || failedRecord.parseError || failedRecord.parseMessage || "background parsing failed"),
         });
       }
+      const activeStatus = mapUploadedAttachmentStatus(remoteRecords[0]);
       clearConversationProgress(req.authUser.id, conversationId);
       return res.json({
         status: "processing",
         success: false,
         errorCode: "ATTACHMENT_PARSING_IN_PROGRESS",
         message: "案卷过大，AI 仍在深度阅卷中，请耐心等待 1-2 分钟后再试。",
+        jobId: String(activeStatus?.jobId || remoteRecords[0]?.jobId || ""),
       });
     }
 
@@ -4065,7 +4828,10 @@ app.listen(PORT, HOST, () => {
   console.log(`👉 上下文记忆条数：${CONTEXT_MAX_MESSAGES > 0 ? CONTEXT_MAX_MESSAGES : "不限制"}`);
   console.log(`👉 上下文保留时长：${Math.round(CONTEXT_TTL_MS / 1000 / 60)} 分钟`);
   console.log(`👉 附件上传：最多 ${MAX_ATTACHMENTS} 个/轮，单个 ${Math.floor(MAX_BINARY_ATTACHMENT_BYTES / 1024 / 1024)}MB`);
-  console.log(`👉 上传架构：${hasOssCredentials() ? "OSS直传 + 后端回填分析" : "本地直传后端（OSS未配置）"}`);
+  console.log(`👉 上传架构：${hasOssCredentials() ? "OSS直传 + Gemini Files异步任务编排" : "本地直传后端（OSS未配置）"}`);
+  console.log(`👉 任务队列：单实例并发=1，队列上限=${ATTACHMENT_JOB_MAX_QUEUE}`);
+  console.log(`👉 Gemini PDF阈值：${Math.floor(GEMINI_PDF_MAX_BYTES / 1024 / 1024)}MB（超限触发外部拆分）`);
+  console.log(`👉 外部拆分Worker：${SPLIT_WORKER_URL ? "已配置" : "未配置"}`);
   console.log(`👉 上传保留时长：${Math.round(UPLOAD_ATTACHMENT_TTL_MS / 1000 / 60)} 分钟`);
   console.log(`👉 运行环境：${NODE_ENV}`);
   console.log(`👉 接口限流：${RATE_LIMIT_MAX_REQUESTS}次/${Math.round(RATE_LIMIT_WINDOW_MS / 1000)}秒`);

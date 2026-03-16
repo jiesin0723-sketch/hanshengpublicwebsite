@@ -1369,6 +1369,7 @@
                 progress: 0,
                 status: "queued",
                 uploadId: "",
+                jobId: "",
                 parseStatus: "",
                 parseMessage: "",
                 parseEtaSeconds: 0,
@@ -1504,6 +1505,7 @@
 
         function applyUploadCompleteResult(item, attachment) {
             item.uploadId = String(attachment?.id || item.uploadId || "");
+            item.jobId = String(attachment?.jobId || item.jobId || "");
             item.parseStatus = String(attachment?.parseStatus || "").toLowerCase();
             item.parseMessage = String(attachment?.parseMessage || "");
             item.parseEtaSeconds = Math.max(0, Number(attachment?.etaSeconds || 0));
@@ -1774,7 +1776,7 @@
                 uploadHeaders["Content-Type"] = item.mimeType;
             }
 
-            await client.multipartUpload(stsPayload.objectKey, item.file, {
+            const multipartResult = await client.multipartUpload(stsPayload.objectKey, item.file, {
                 partSize,
                 parallel,
                 timeout: 20 * 60 * 1000,
@@ -1791,13 +1793,19 @@
             item.progress = 98;
             item.xhr = null;
             renderAttachmentList();
+            const multipartEtag = String(
+                multipartResult?.res?.headers?.etag
+                || multipartResult?.etag
+                || ""
+            ).trim().replace(/^"+|"+$/g, "");
 
             const completeData = await requestUploadCompleteWithRetry({
                 conversationId,
                 objectKey: stsPayload.objectKey,
                 fileName: item.name,
                 mimeType: item.mimeType,
-                size: item.size
+                size: item.size,
+                etag: multipartEtag
             });
             if (!completeData?.success || !completeData?.attachment?.id) {
                 const errMsg = completeData?.message || completeData?.error || "OSS回填失败";
@@ -1837,7 +1845,7 @@
                 `url_prefix=${String(presign.uploadUrl || "").slice(0, 80)}...`
             );
 
-            await new Promise((resolve, reject) => {
+            return new Promise((resolve, reject) => {
                 const xhr = new XMLHttpRequest();
                 xhr.open(uploadMethod, presign.uploadUrl, true);
                 xhr.withCredentials = false;
@@ -1856,7 +1864,8 @@
                     item.xhr = null;
                     if ([200, 201, 204].includes(xhr.status)) {
                         console.log(`[OSS直传成功] method=${uploadMethod} file=${item.name}`);
-                        resolve();
+                        const etag = String(xhr.getResponseHeader("ETag") || "").trim().replace(/^"+|"+$/g, "");
+                        resolve({ etag });
                         return;
                     }
                     const ossText = String(xhr.responseText || "").trim().slice(0, 800);
@@ -1910,16 +1919,19 @@
         async function uploadAttachmentViaOss(item, conversationId) {
             let presign = await requestOssPresign(conversationId, item);
             let uploadOk = false;
+            let uploadEtag = "";
 
             try {
-                await executeOssUpload(item, presign);
+                const uploaded = await executeOssUpload(item, presign);
+                uploadEtag = String(uploaded?.etag || "");
                 uploadOk = true;
             } catch (firstError) {
                 console.warn("[OSS首次上传失败]:", String(firstError?.message || ""));
                 if (shouldFallbackToPost(presign?.method, firstError)) {
                     try {
                         presign = await requestOssPresign(conversationId, item, "POST");
-                        await executeOssUpload(item, presign);
+                        const uploaded = await executeOssUpload(item, presign);
+                        uploadEtag = String(uploaded?.etag || "");
                         uploadOk = true;
                     } catch (postError) {
                         console.warn("[POST回退也失败]:", String(postError?.message || ""));
@@ -1944,7 +1956,8 @@
                 objectKey: presign.objectKey,
                 fileName: item.name,
                 mimeType: item.mimeType,
-                size: item.size
+                size: item.size,
+                etag: uploadEtag
             });
             if (!completeData?.success || !completeData?.attachment?.id) {
                 const errMsg = completeData?.message || completeData?.error || "OSS回填失败";
@@ -1971,15 +1984,15 @@
                         setUploadFailed(item, errorMsg);
                         return;
                     }
-                    console.warn("[STS分片上传失败，尝试回退后端上传]:", errorCode, errorMsg);
+                    console.warn("[STS分片上传失败，尝试回退OSS预签名直传]:", errorCode, errorMsg);
                     try {
                         item.status = "uploading";
                         item.progress = 0;
                         renderAttachmentList();
-                        await uploadAttachmentViaBackend(item, conversationId);
-                    } catch (backendFallbackError) {
-                        console.error("[后端上传也失败]:", String(backendFallbackError?.message || ""));
-                        setUploadFailed(item, backendFallbackError?.message || errorMsg || "upload failed");
+                        await uploadAttachmentViaOss(item, conversationId);
+                    } catch (ossFallbackError) {
+                        console.error("[OSS预签名回退也失败]:", String(ossFallbackError?.message || ""));
+                        setUploadFailed(item, ossFallbackError?.message || errorMsg || "upload failed");
                     }
                 }
             })();
