@@ -6,6 +6,7 @@
     <title>汉盛律师 - 智能法律助手</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r134/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/vanta@latest/dist/vanta.waves.min.js"></script>
+    <script src="https://gosspublic.alicdn.com/aliyun-oss-sdk-6.20.0.min.js"></script>
     
     <style>
         /* --- 全局暗黑科幻风格 --- */
@@ -554,6 +555,7 @@
         const DEFAULT_THINKING_MODE = "standard";
         const MAX_ATTACHMENTS = 15;
         const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
+        const ATTACHMENT_STATUS_POLL_INTERVAL_MS = 2000;
         const TEXT_MIME_TYPES = new Set(["text/plain", "text/markdown", "text/csv", "application/json"]);
         const BINARY_MIME_TYPES = new Set([
             "application/pdf",
@@ -573,6 +575,8 @@
         let serverDefaultModel = DEFAULT_MODEL;
         let pendingAttachments = [];
         let thinkingProgressTimer = null;
+        let attachmentStatusPollTimer = null;
+        let attachmentStatusPollInFlight = false;
 
         const i18n = {
             zh: {
@@ -606,6 +610,8 @@
                 uploadSuccess: "上传成功",
                 uploading: "上传中 {p}%",
                 uploadFinalizing: "回填中...",
+                attachmentProcessingFallback: "正在识别扫描件文字",
+                attachmentEta: "预计剩余 {s} 秒",
                 replyPending: "正在生成专业法律分析，请稍候...",
                 conversationBusy: "当前对话仍在处理中，请稍候，或切换到其他窗口继续提问。",
                 processingTag: "处理中",
@@ -646,6 +652,8 @@
                 uploadSuccess: "Uploaded",
                 uploading: "Uploading {p}%",
                 uploadFinalizing: "Finalizing...",
+                attachmentProcessingFallback: "Recognizing scanned document text",
+                attachmentEta: "Estimated remaining {s}s",
                 replyPending: "Generating professional legal analysis...",
                 conversationBusy: "This conversation is still processing. Wait or switch to another conversation.",
                 processingTag: "Processing",
@@ -1361,9 +1369,18 @@
                 progress: 0,
                 status: "queued",
                 uploadId: "",
+                parseStatus: "",
+                parseMessage: "",
+                parseEtaSeconds: 0,
+                parseProgressPercent: 0,
                 errorMessage: "",
                 xhr: null
             };
+        }
+
+        function isAttachmentInServerProcessing(item) {
+            const parseStatus = String(item?.parseStatus || "").toLowerCase();
+            return item?.status === "processing" || parseStatus === "pending" || parseStatus === "processing";
         }
 
         function getAttachmentStatusText(item) {
@@ -1371,7 +1388,12 @@
                 return i18n[currentLang].uploading.replace("{p}", String(item.progress || 0));
             }
             if (item.status === "processing") {
-                return i18n[currentLang].uploadFinalizing;
+                const message = String(item.parseMessage || i18n[currentLang].attachmentProcessingFallback || i18n[currentLang].uploadFinalizing);
+                const etaSeconds = Math.max(0, Number(item.parseEtaSeconds || 0));
+                if (etaSeconds > 0) {
+                    return `${message} · ${i18n[currentLang].attachmentEta.replace("{s}", String(etaSeconds))}`;
+                }
+                return message;
             }
             if (item.status === "success") {
                 return i18n[currentLang].uploadSuccess;
@@ -1447,6 +1469,7 @@
             }
             pendingAttachments.splice(index, 1);
             renderAttachmentList();
+            ensureAttachmentStatusPolling();
             if (options.deleteRemote && item.status === "success" && item.uploadId) {
                 deleteUploadedAttachmentOnServer(item.uploadId);
             }
@@ -1456,6 +1479,7 @@
             const snapshot = [...pendingAttachments];
             pendingAttachments = [];
             renderAttachmentList();
+            stopAttachmentStatusPolling();
             snapshot.forEach((item) => {
                 if (item?.xhr) {
                     try { item.xhr.abort(); } catch {}
@@ -1469,18 +1493,167 @@
         function setUploadFailed(item, errorMessage) {
             item.status = "error";
             item.errorMessage = String(errorMessage || "upload failed");
+            item.parseStatus = "failed";
+            item.parseMessage = "";
+            item.parseEtaSeconds = 0;
+            item.parseProgressPercent = 100;
             item.xhr = null;
             renderAttachmentList();
+            ensureAttachmentStatusPolling();
         }
 
-        function applyUploadSuccess(item, attachmentId) {
-            item.status = "success";
-            item.progress = 100;
-            item.uploadId = String(attachmentId || "");
+        function applyUploadCompleteResult(item, attachment) {
+            item.uploadId = String(attachment?.id || item.uploadId || "");
+            item.parseStatus = String(attachment?.parseStatus || "").toLowerCase();
+            item.parseMessage = String(attachment?.parseMessage || "");
+            item.parseEtaSeconds = Math.max(0, Number(attachment?.etaSeconds || 0));
+            item.parseProgressPercent = Math.max(0, Math.min(100, Number(attachment?.progressPercent || 0)));
             item.errorMessage = "";
             item.file = null;
             item.xhr = null;
+
+            if (item.parseStatus === "failed") {
+                item.status = "error";
+                item.progress = 0;
+                item.errorMessage = String(attachment?.parseError || attachment?.parseMessage || i18n[currentLang].uploadFailed);
+            } else if (item.parseStatus && item.parseStatus !== "ready") {
+                item.status = "processing";
+                const progressByServer = Math.max(5, Math.min(99, Math.floor(item.parseProgressPercent || 5)));
+                item.progress = Math.max(95, progressByServer);
+            } else {
+                item.status = "success";
+                item.progress = 100;
+                item.parseStatus = "ready";
+                item.parseMessage = "";
+                item.parseEtaSeconds = 0;
+                item.parseProgressPercent = 100;
+            }
             renderAttachmentList();
+            ensureAttachmentStatusPolling();
+        }
+
+        async function requestUploadStatuses(uploadIds, conversationId) {
+            return requestBackend("/api/uploads/status", {
+                method: "POST",
+                requireAuth: true,
+                timeoutMs: 45_000,
+                body: {
+                    conversationId,
+                    uploadIds
+                }
+            });
+        }
+
+        async function pollAttachmentStatuses() {
+            if (attachmentStatusPollInFlight || !currentUser) {
+                return;
+            }
+            const activeConversation = getActiveConversation();
+            const conversationId = activeConversation?.id || "";
+            const targets = pendingAttachments
+                .filter((item) => item.uploadId && isAttachmentInServerProcessing(item))
+                .map((item) => String(item.uploadId || "").trim())
+                .filter(Boolean);
+
+            if (targets.length === 0) {
+                stopAttachmentStatusPolling();
+                return;
+            }
+
+            attachmentStatusPollInFlight = true;
+            try {
+                const response = await requestUploadStatuses(targets, conversationId);
+                const statusMap = new Map(
+                    (Array.isArray(response?.attachments) ? response.attachments : [])
+                        .map((item) => [String(item?.id || ""), item])
+                );
+
+                let changed = false;
+                pendingAttachments.forEach((item) => {
+                    if (!item.uploadId) return;
+                    const statusPayload = statusMap.get(String(item.uploadId || ""));
+                    if (!statusPayload) return;
+                    const prevParseStatus = String(item.parseStatus || "").toLowerCase();
+                    const prevParseMessage = String(item.parseMessage || "");
+                    const prevEtaSeconds = Math.max(0, Number(item.parseEtaSeconds || 0));
+                    const prevParseProgress = Math.max(0, Math.min(100, Number(item.parseProgressPercent || 0)));
+                    const parseStatus = String(statusPayload.parseStatus || "").toLowerCase();
+                    item.parseStatus = parseStatus;
+                    item.parseMessage = String(statusPayload.parseMessage || "");
+                    item.parseEtaSeconds = Math.max(0, Number(statusPayload.etaSeconds || 0));
+                    item.parseProgressPercent = Math.max(0, Math.min(100, Number(statusPayload.progressPercent || 0)));
+                    if (
+                        prevParseStatus !== item.parseStatus ||
+                        prevParseMessage !== item.parseMessage ||
+                        prevEtaSeconds !== item.parseEtaSeconds ||
+                        prevParseProgress !== item.parseProgressPercent
+                    ) {
+                        changed = true;
+                    }
+
+                    if (parseStatus === "ready") {
+                        if (item.status !== "success" || item.progress !== 100) {
+                            item.status = "success";
+                            item.progress = 100;
+                            item.errorMessage = "";
+                            changed = true;
+                        }
+                        return;
+                    }
+                    if (parseStatus === "failed") {
+                        const nextError = String(statusPayload.parseError || statusPayload.parseMessage || i18n[currentLang].uploadFailed);
+                        if (item.status !== "error" || item.errorMessage !== nextError) {
+                            item.status = "error";
+                            item.progress = 0;
+                            item.errorMessage = nextError;
+                            changed = true;
+                        }
+                        return;
+                    }
+                    if (parseStatus === "pending" || parseStatus === "processing") {
+                        const serverProgress = Math.max(5, Math.min(99, Math.floor(item.parseProgressPercent || 5)));
+                        const nextProgress = Math.max(95, serverProgress);
+                        if (item.status !== "processing" || item.progress !== nextProgress) {
+                            item.status = "processing";
+                            item.progress = nextProgress;
+                            changed = true;
+                        }
+                    }
+                });
+                if (changed) {
+                    renderAttachmentList();
+                }
+            } catch (error) {
+                console.warn("轮询附件解析状态失败", error);
+            } finally {
+                attachmentStatusPollInFlight = false;
+                const stillProcessing = pendingAttachments.some((item) => item.uploadId && isAttachmentInServerProcessing(item));
+                if (!stillProcessing) {
+                    stopAttachmentStatusPolling();
+                }
+            }
+        }
+
+        function stopAttachmentStatusPolling() {
+            if (attachmentStatusPollTimer) {
+                clearInterval(attachmentStatusPollTimer);
+                attachmentStatusPollTimer = null;
+            }
+            attachmentStatusPollInFlight = false;
+        }
+
+        function ensureAttachmentStatusPolling() {
+            const needsPolling = pendingAttachments.some((item) => item.uploadId && isAttachmentInServerProcessing(item));
+            if (!needsPolling) {
+                stopAttachmentStatusPolling();
+                return;
+            }
+            if (!attachmentStatusPollTimer) {
+                attachmentStatusPollTimer = setInterval(() => {
+                    pollAttachmentStatuses();
+                }, ATTACHMENT_STATUS_POLL_INTERVAL_MS);
+            }
+            pollAttachmentStatuses();
         }
 
         async function requestUploadCompleteWithRetry(payload, maxAttempts = 3) {
@@ -1537,7 +1710,7 @@
                         ? xhr.response
                         : safeJSONParse(xhr.responseText || "{}", {});
                     if (xhr.status === 200 && data?.success && data?.attachment?.id) {
-                        applyUploadSuccess(item, data.attachment.id);
+                        applyUploadCompleteResult(item, data.attachment);
                         resolve();
                         return;
                     }
@@ -1551,6 +1724,86 @@
                 xhr.onabort = () => reject(new Error("aborted"));
                 xhr.send(formData);
             });
+        }
+
+        async function requestOssSts(conversationId, item) {
+            return requestBackend("/api/uploads/sts", {
+                method: "POST",
+                requireAuth: true,
+                body: {
+                    conversationId,
+                    fileName: item.name,
+                    mimeType: item.mimeType,
+                    size: item.size
+                }
+            });
+        }
+
+        function createOssBrowserClient(stsPayload) {
+            const OSSGlobal = window.OSS;
+            const OSSCtor = typeof OSSGlobal === "function" ? OSSGlobal : OSSGlobal?.Wrapper;
+            if (!OSSCtor) {
+                throw new Error("浏览器端 OSS SDK 未加载，无法执行分片上传");
+            }
+            const credentials = stsPayload?.credentials || {};
+            if (!credentials.accessKeyId || !credentials.accessKeySecret || !credentials.securityToken) {
+                throw new Error("STS临时凭证不完整，无法执行分片上传");
+            }
+            return new OSSCtor({
+                region: String(stsPayload.region || ""),
+                bucket: String(stsPayload.bucket || ""),
+                endpoint: String(stsPayload.endpoint || ""),
+                secure: Boolean(stsPayload.secure !== false),
+                accessKeyId: String(credentials.accessKeyId || ""),
+                accessKeySecret: String(credentials.accessKeySecret || ""),
+                stsToken: String(credentials.securityToken || ""),
+                timeout: 20 * 60 * 1000
+            });
+        }
+
+        async function uploadAttachmentViaStsMultipart(item, conversationId) {
+            const stsPayload = await requestOssSts(conversationId, item);
+            if (!stsPayload?.success || !stsPayload?.objectKey) {
+                throw new Error(String(stsPayload?.message || "STS签发失败"));
+            }
+            const client = createOssBrowserClient(stsPayload);
+            const partSize = Math.max(256 * 1024, Number(stsPayload.partSize || 2 * 1024 * 1024));
+            const parallel = Math.max(1, Number(stsPayload.parallel || 3));
+            const uploadHeaders = {};
+            if (item.mimeType) {
+                uploadHeaders["Content-Type"] = item.mimeType;
+            }
+
+            await client.multipartUpload(stsPayload.objectKey, item.file, {
+                partSize,
+                parallel,
+                timeout: 20 * 60 * 1000,
+                mime: item.mimeType || undefined,
+                headers: uploadHeaders,
+                progress: (p, checkpoint) => {
+                    item.progress = Math.max(1, Math.min(95, Math.round(Number(p || 0) * 95)));
+                    renderAttachmentList();
+                    return checkpoint;
+                }
+            });
+
+            item.status = "processing";
+            item.progress = 98;
+            item.xhr = null;
+            renderAttachmentList();
+
+            const completeData = await requestUploadCompleteWithRetry({
+                conversationId,
+                objectKey: stsPayload.objectKey,
+                fileName: item.name,
+                mimeType: item.mimeType,
+                size: item.size
+            });
+            if (!completeData?.success || !completeData?.attachment?.id) {
+                const errMsg = completeData?.message || completeData?.error || "OSS回填失败";
+                throw new Error(errMsg);
+            }
+            applyUploadCompleteResult(item, completeData.attachment);
         }
 
         async function requestOssPresign(conversationId, item, uploadMethod = "") {
@@ -1698,7 +1951,7 @@
                 console.error("[OSS回填失败]:", errMsg);
                 throw new Error(errMsg);
             }
-            applyUploadSuccess(item, completeData.attachment.id);
+            applyUploadCompleteResult(item, completeData.attachment);
         }
 
         function uploadAttachmentItem(item, conversationId) {
@@ -1709,24 +1962,29 @@
 
             (async () => {
                 try {
-                    await uploadAttachmentViaOss(item, conversationId);
+                    await uploadAttachmentViaStsMultipart(item, conversationId);
                 } catch (error) {
                     const errorMsg = String(error?.message || "");
                     const errorCode = String(error?.errorCode || "");
-                    console.warn("[OSS直传失败，尝试回退后端上传]:", errorCode, errorMsg);
                     const noFallback = /附件类型不支持|不支持的附件|超过.*限制|大小无效/i.test(errorMsg);
                     if (noFallback) {
                         setUploadFailed(item, errorMsg);
                         return;
                     }
+                    console.warn("[STS分片上传失败，尝试回退OSS直传]:", errorCode, errorMsg);
                     try {
-                        item.status = "uploading";
-                        item.progress = 0;
-                        renderAttachmentList();
-                        await uploadAttachmentViaBackend(item, conversationId);
-                    } catch (fallbackError) {
-                        console.error("[后端上传也失败]:", String(fallbackError?.message || ""));
-                        setUploadFailed(item, fallbackError?.message || errorMsg || "upload failed");
+                        await uploadAttachmentViaOss(item, conversationId);
+                    } catch (ossFallbackError) {
+                        console.warn("[OSS直传失败，尝试回退后端上传]:", String(ossFallbackError?.message || ""));
+                        try {
+                            item.status = "uploading";
+                            item.progress = 0;
+                            renderAttachmentList();
+                            await uploadAttachmentViaBackend(item, conversationId);
+                        } catch (backendFallbackError) {
+                            console.error("[后端上传也失败]:", String(backendFallbackError?.message || ""));
+                            setUploadFailed(item, backendFallbackError?.message || String(ossFallbackError?.message || errorMsg || "upload failed"));
+                        }
                     }
                 }
             })();
@@ -1882,6 +2140,7 @@
 
         function setAuthRequiredState() {
             clearThinkingProgress();
+            stopAttachmentStatusPolling();
             activeRequests.clear();
             elements.thinkingStatus.hidden = true;
             elements.thinkingBar.style.width = "0";

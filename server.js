@@ -8,6 +8,7 @@ const path = require("path");
 const multer = require("multer");
 const OSS = require("ali-oss");
 const OpenApi = require("@alicloud/openapi-client");
+const AlibabaCloudSts = require("@alicloud/sts20150401");
 const AlibabaCloudDocMind = require("@alicloud/docmind-api20220711");
 const TeaUtil = require("@alicloud/tea-util");
 const mammoth = require("mammoth");
@@ -252,10 +253,21 @@ const OSS_PUBLIC_BASE_URL = String(process.env.OSS_PUBLIC_BASE_URL || "").trim()
 const OSS_UPLOAD_METHOD = ["PUT", "POST"].includes(String(process.env.OSS_UPLOAD_METHOD || "PUT").trim().toUpperCase())
   ? String(process.env.OSS_UPLOAD_METHOD || "PUT").trim().toUpperCase()
   : "PUT";
+const OSS_STS_ENABLED = readBool("OSS_STS_ENABLED", true);
+const OSS_STS_ROLE_ARN = String(process.env.OSS_STS_ROLE_ARN || "").trim();
+const OSS_STS_EXTERNAL_ID = String(process.env.OSS_STS_EXTERNAL_ID || "").trim();
+const OSS_STS_REGION_ID = String(process.env.OSS_STS_REGION_ID || "cn-hangzhou").trim();
+const OSS_STS_ENDPOINT = String(process.env.OSS_STS_ENDPOINT || "sts.aliyuncs.com").trim();
+const OSS_STS_DURATION_SECONDS = readPositiveInt("OSS_STS_DURATION_SECONDS", 3600);
+const OSS_STS_SESSION_PREFIX = String(process.env.OSS_STS_SESSION_PREFIX || "hansheng-upload").trim();
+const OSS_MULTIPART_PART_SIZE_BYTES = readPositiveInt("OSS_MULTIPART_PART_SIZE_BYTES", 2 * 1024 * 1024);
+const OSS_MULTIPART_PARALLEL = readPositiveInt("OSS_MULTIPART_PARALLEL", 3);
 const DOCMIND_ENDPOINT = "docmind-api.cn-hangzhou.aliyuncs.com";
 const DOCMIND_REGION_ID = String(process.env.DOCMIND_REGION_ID || process.env.OCR_REGION_ID || "cn-hangzhou").trim();
 const OSS_SIGNED_URL_EXPIRE_SECONDS = readPositiveInt("OSS_SIGNED_URL_EXPIRE_SECONDS", 3600);
 const OSS_REGION = String(process.env.OSS_REGION || detectOssRegion()).trim();
+const ATTACHMENT_PARSE_BASE_ETA_MS = readPositiveInt("ATTACHMENT_PARSE_BASE_ETA_MS", 180_000);
+const ATTACHMENT_PARSE_MAX_ETA_MS = readPositiveInt("ATTACHMENT_PARSE_MAX_ETA_MS", 20 * 60 * 1000);
 
 const DEFAULT_ALLOWED_MODELS = [
   "gemini-3.1-pro-preview",
@@ -749,6 +761,98 @@ function createTaggedError(code, message, detail = "", statusCode = 500) {
 
 let docMindClientInstance = null;
 let ossClientInstance = null;
+let stsClientInstance = null;
+
+function hasOssStsConfig() {
+  return Boolean(
+    OSS_STS_ENABLED &&
+      OSS_STS_ROLE_ARN &&
+      OSS_ACCESS_KEY_ID &&
+      OSS_ACCESS_KEY_SECRET &&
+      OSS_BUCKET &&
+      OSS_REGION
+  );
+}
+
+function sanitizeStsSessionName(value) {
+  const raw = String(value || "")
+    .replace(/[^a-zA-Z0-9@._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return raw || "session";
+}
+
+function buildStsPolicyForObject(objectKey) {
+  const normalizedObjectKey = String(objectKey || "").replace(/^\/+/, "");
+  const bucketResource = `acs:oss:*:*:${OSS_BUCKET}`;
+  const objectResource = `acs:oss:*:*:${OSS_BUCKET}/${normalizedObjectKey}`;
+  return JSON.stringify({
+    Version: "1",
+    Statement: [
+      {
+        Effect: "Allow",
+        Action: [
+          "oss:PutObject",
+          "oss:InitiateMultipartUpload",
+          "oss:UploadPart",
+          "oss:CompleteMultipartUpload",
+          "oss:AbortMultipartUpload",
+          "oss:ListParts",
+        ],
+        Resource: [bucketResource, objectResource],
+      },
+    ],
+  });
+}
+
+function getAliyunStsClient() {
+  if (stsClientInstance) return stsClientInstance;
+  if (!OSS_ACCESS_KEY_ID || !OSS_ACCESS_KEY_SECRET) {
+    throw createTaggedError("OSS_STS_NOT_CONFIGURED", "OSS STS 未配置完整，请检查环境变量。", "", 500);
+  }
+  const config = new OpenApi.Config({
+    accessKeyId: OSS_ACCESS_KEY_ID,
+    accessKeySecret: OSS_ACCESS_KEY_SECRET,
+    endpoint: OSS_STS_ENDPOINT,
+    regionId: OSS_STS_REGION_ID,
+  });
+  stsClientInstance = new AlibabaCloudSts.default(config);
+  return stsClientInstance;
+}
+
+async function issueOssStsCredentials({ userId, objectKey }) {
+  if (!hasOssStsConfig()) {
+    throw createTaggedError("OSS_STS_NOT_CONFIGURED", "OSS STS 未配置完整，请检查角色与环境变量。", "", 500);
+  }
+  const client = getAliyunStsClient();
+  const sessionName = sanitizeStsSessionName(
+    `${OSS_STS_SESSION_PREFIX}-${String(userId || "user").slice(0, 20)}-${Date.now()}`
+  );
+  const request = new AlibabaCloudSts.AssumeRoleRequest({
+    roleArn: OSS_STS_ROLE_ARN,
+    roleSessionName: sessionName,
+    durationSeconds: Math.max(900, Math.min(3600, OSS_STS_DURATION_SECONDS)),
+    policy: buildStsPolicyForObject(objectKey),
+    externalId: OSS_STS_EXTERNAL_ID || undefined,
+  });
+  const runtime = new TeaUtil.RuntimeOptions({
+    connectTimeout: 15000,
+    readTimeout: 30000,
+    autoretry: true,
+    maxAttempts: 2,
+  });
+  const response = await client.assumeRoleWithOptions(request, runtime);
+  const credentials = response?.body?.credentials;
+  if (!credentials?.accessKeyId || !credentials?.accessKeySecret || !credentials?.securityToken) {
+    throw createTaggedError("OSS_STS_ISSUE_FAILED", "STS 临时凭证签发失败：返回字段不完整。", "", 502);
+  }
+  return {
+    accessKeyId: String(credentials.accessKeyId),
+    accessKeySecret: String(credentials.accessKeySecret),
+    securityToken: String(credentials.securityToken),
+    expiration: String(credentials.expiration || ""),
+  };
+}
 
 function getOssClient() {
   if (ossClientInstance) return ossClientInstance;
@@ -1907,6 +2011,94 @@ function findUploadedAttachmentByObjectKey({ userId, conversationId, objectKey }
   return null;
 }
 
+function estimateAttachmentParseBudgetMs(record) {
+  const sizeBytes = Math.max(0, Number(record?.size || 0));
+  const sizeMb = Math.max(1, Math.ceil(sizeBytes / 1024 / 1024));
+  const mimeType = String(record?.mimeType || "").toLowerCase();
+  const parseAttempts = Math.max(0, Number(record?.parseAttempts || 0));
+  const perMbMs = mimeType === "application/pdf" ? 5_500 : 2_400;
+  const retryPenaltyMs = parseAttempts * DOCMIND_TIMEOUT_RETRY_DELAY_MS;
+  const estimated = ATTACHMENT_PARSE_BASE_ETA_MS + sizeMb * perMbMs + retryPenaltyMs;
+  return Math.max(45_000, Math.min(ATTACHMENT_PARSE_MAX_ETA_MS, estimated));
+}
+
+function computeAttachmentParseEtaSeconds(record) {
+  const parseStatus = String(record?.parseStatus || "").toLowerCase();
+  if (parseStatus === "ready" || parseStatus === "failed") {
+    return 0;
+  }
+  const startedAt = Number(record?.parseStartedAt || 0);
+  const now = Date.now();
+  const budgetMs = estimateAttachmentParseBudgetMs(record);
+  if (!startedAt || startedAt > now) {
+    return Math.ceil(budgetMs / 1000);
+  }
+  const elapsedMs = Math.max(0, now - startedAt);
+  const remainMs = Math.max(3_000, budgetMs - elapsedMs);
+  return Math.ceil(remainMs / 1000);
+}
+
+function computeAttachmentProgressPercent(record) {
+  const parseStatus = String(record?.parseStatus || "").toLowerCase();
+  if (parseStatus === "ready") return 100;
+  if (parseStatus === "failed") return 100;
+  const startedAt = Number(record?.parseStartedAt || 0);
+  if (!startedAt) return 6;
+  const now = Date.now();
+  const budgetMs = estimateAttachmentParseBudgetMs(record);
+  const elapsedMs = Math.max(0, now - startedAt);
+  const ratio = Math.min(0.95, elapsedMs / Math.max(1, budgetMs));
+  return Math.max(8, Math.floor(ratio * 100));
+}
+
+function mapUploadedAttachmentStatus(record) {
+  if (!record) return null;
+  const base = {
+    id: record.id,
+    name: record.name,
+    conversationId: record.conversationId,
+    kind: record.kind,
+    mimeType: record.mimeType,
+    size: Number(record.size) || 0,
+    updatedAt: Math.max(
+      Number(record.parseFinishedAt || 0),
+      Number(record.parseStartedAt || 0),
+      Number(record.createdAt || 0)
+    ),
+  };
+
+  if (record.kind !== "remote") {
+    return {
+      ...base,
+      parseStatus: "ready",
+      parseMessage: "附件已可用于问答",
+      parseError: "",
+      etaSeconds: 0,
+      progressPercent: 100,
+    };
+  }
+
+  const parseStatus = String(record.parseStatus || "pending").toLowerCase();
+  const fallbackMessage = parseStatus === "ready"
+    ? "后台识别完成"
+    : parseStatus === "failed"
+    ? "后台识别失败"
+    : parseStatus === "processing"
+    ? "正在识别扫描件文字"
+    : "AI后台深度识别中";
+
+  return {
+    ...base,
+    parseStatus,
+    parseMessage: String(record.parseMessage || fallbackMessage),
+    parseError: String(record.parseError || ""),
+    etaSeconds: computeAttachmentParseEtaSeconds(record),
+    progressPercent: computeAttachmentProgressPercent(record),
+    parseStartedAt: Number(record.parseStartedAt || 0),
+    parseFinishedAt: Number(record.parseFinishedAt || 0),
+  };
+}
+
 async function materializeUploadedAttachmentRecord(record, progressReporter = null) {
   if (!record || record.kind !== "remote") return record;
   if (typeof progressReporter === "function") {
@@ -2171,6 +2363,75 @@ function getPublicObjectUrl(objectKey) {
   return `${base}/${encodeOssObjectKey(objectKey)}`;
 }
 
+async function handleUploadSts(req, res) {
+  if (!hasOssCredentials()) {
+    return res.status(400).json({
+      success: false,
+      errorCode: "OSS_NOT_CONFIGURED",
+      message: "OSS 未配置，暂无法启用 STS 分片上传",
+    });
+  }
+  if (!hasOssStsConfig()) {
+    return res.status(400).json({
+      success: false,
+      errorCode: "OSS_STS_NOT_CONFIGURED",
+      message: "OSS STS 未配置，已自动回退到普通直传链路",
+    });
+  }
+
+  const conversationId = normalizeConversationId(req.body?.conversationId);
+  const fileName = normalizeFilename(req.body?.fileName || req.body?.name, "附件");
+  const fileSize = Number(req.body?.size) || 0;
+  if (fileSize <= 0 || fileSize > MAX_BINARY_ATTACHMENT_BYTES) {
+    return res.status(400).json({
+      success: false,
+      message: `附件大小无效，单个文件最大 ${Math.floor(MAX_BINARY_ATTACHMENT_BYTES / 1024 / 1024)}MB`,
+    });
+  }
+
+  const objectKey = buildOssObjectKey({
+    userId: req.authUser.id,
+    conversationId,
+    fileName,
+  });
+
+  try {
+    const credentials = await issueOssStsCredentials({
+      userId: req.authUser.id,
+      objectKey,
+    });
+    console.log(
+      "STS凭证下发:",
+      `user=${req.authUser.id}`,
+      `conversation=${conversationId}`,
+      `size=${fileSize}`,
+      `objectKey=${objectKey}`
+    );
+    return res.json({
+      success: true,
+      mode: "oss-sts-multipart",
+      objectKey,
+      bucket: OSS_BUCKET,
+      region: OSS_REGION,
+      endpoint: normalizeHost(OSS_ENDPOINT),
+      secure: OSS_FORCE_HTTPS,
+      partSize: Math.max(256 * 1024, OSS_MULTIPART_PART_SIZE_BYTES),
+      parallel: Math.max(1, OSS_MULTIPART_PARALLEL),
+      credentials,
+      expiresAt: credentials.expiration,
+    });
+  } catch (error) {
+    const detail = normalizeErrorMessage(error);
+    console.error("STS签发失败:", detail);
+    return res.status(502).json({
+      success: false,
+      errorCode: String(error?.code || "OSS_STS_ISSUE_FAILED"),
+      message: "STS 临时凭证签发失败，请检查角色授权或稍后重试",
+      error: detail,
+    });
+  }
+}
+
 async function handleUploadPresign(req, res) {
   if (!hasOssCredentials()) {
     return res.status(400).json({
@@ -2343,6 +2604,7 @@ async function handleUploadComplete(req, res) {
       if (existingRecord.kind === "remote") {
         scheduleAttachmentMaterialization(existingRecord);
       }
+      const statusPayload = mapUploadedAttachmentStatus(existingRecord);
       const parseStatus = String(existingRecord.parseStatus || "").toLowerCase();
       const message = parseStatus === "ready"
         ? "案卷已在后台识别完成，可直接提问。"
@@ -2363,7 +2625,10 @@ async function handleUploadComplete(req, res) {
           kind: existingRecord.kind,
           conversationId: existingRecord.conversationId,
           source: "oss",
-          parseStatus: existingRecord.parseStatus || "",
+          parseStatus: statusPayload?.parseStatus || "",
+          parseMessage: statusPayload?.parseMessage || "",
+          etaSeconds: Number(statusPayload?.etaSeconds || 0),
+          progressPercent: Number(statusPayload?.progressPercent || 0),
         },
       });
     }
@@ -2377,6 +2642,7 @@ async function handleUploadComplete(req, res) {
     });
     uploadedAttachments.set(record.id, record);
     scheduleAttachmentMaterialization(record);
+    const statusPayload = mapUploadedAttachmentStatus(record);
 
     return res.json({
       status: "success",
@@ -2391,7 +2657,10 @@ async function handleUploadComplete(req, res) {
         kind: record.kind,
         conversationId: record.conversationId,
         source: "oss",
-        parseStatus: record.parseStatus || "",
+        parseStatus: statusPayload?.parseStatus || "",
+        parseMessage: statusPayload?.parseMessage || "",
+        etaSeconds: Number(statusPayload?.etaSeconds || 0),
+        progressPercent: Number(statusPayload?.progressPercent || 0),
       },
     });
   } catch (error) {
@@ -2421,6 +2690,68 @@ async function handleUploadComplete(req, res) {
       error: detail,
     });
   }
+}
+
+async function handleUploadStatus(req, res) {
+  const conversationId = normalizeConversationId(req.body?.conversationId);
+  const uploadIds = normalizeAttachmentIds(req.body?.uploadIds);
+  if (uploadIds.length === 0) {
+    return res.status(400).json({
+      success: false,
+      message: "uploadIds 不能为空",
+    });
+  }
+
+  const attachments = [];
+  for (const uploadId of uploadIds) {
+    const record = uploadedAttachments.get(uploadId);
+    if (!record || record.userId !== req.authUser.id) {
+      attachments.push({
+        id: uploadId,
+        parseStatus: "not_found",
+        parseMessage: "附件不存在或已过期",
+        parseError: "",
+        etaSeconds: 0,
+        progressPercent: 100,
+      });
+      continue;
+    }
+
+    if (conversationId && record.conversationId !== conversationId) {
+      attachments.push({
+        id: uploadId,
+        parseStatus: "not_found",
+        parseMessage: "附件不属于当前会话",
+        parseError: "",
+        etaSeconds: 0,
+        progressPercent: 100,
+      });
+      continue;
+    }
+
+    record.expiresAt = Date.now() + UPLOAD_ATTACHMENT_TTL_MS;
+    uploadedAttachments.set(record.id, record);
+    if (record.kind === "remote") {
+      const parseStatus = String(record.parseStatus || "").toLowerCase();
+      if (parseStatus === "pending" || parseStatus === "processing") {
+        scheduleAttachmentMaterialization(record);
+      }
+    }
+    attachments.push(mapUploadedAttachmentStatus(record));
+  }
+
+  const processingCount = attachments.filter((item) => {
+    const status = String(item?.parseStatus || "").toLowerCase();
+    return status === "pending" || status === "processing";
+  }).length;
+
+  return res.json({
+    success: true,
+    attachments,
+    processingCount,
+    allReady: processingCount === 0,
+    now: Date.now(),
+  });
 }
 
 setInterval(() => {
@@ -2558,8 +2889,10 @@ app.get("/api/chat-progress", requireAuth, (req, res) => {
   });
 });
 
+app.post("/api/uploads/sts", requireAuth, handleUploadSts);
 app.post("/api/uploads/presign", requireAuth, handleUploadPresign);
 app.post("/api/uploads/complete", requireAuth, handleUploadComplete);
+app.post("/api/uploads/status", requireAuth, handleUploadStatus);
 app.post("/api/uploads", requireAuth, uploadSingleFileMiddleware, handleUploadAttachment);
 
 app.post("/api/uploads/delete", requireAuth, async (req, res) => {
