@@ -2663,6 +2663,22 @@ function collectJobAttachmentRecords(job) {
   return records;
 }
 
+function shouldUseGeminiFilePipeline(mimeType) {
+  const normalizedMime = String(mimeType || "").toLowerCase().trim();
+  if (!normalizedMime) return false;
+  if (normalizedMime === "application/pdf") return true;
+  return normalizedMime.startsWith("image/");
+}
+
+function shouldUseLocalTextExtraction(mimeType) {
+  const normalizedMime = String(mimeType || "").toLowerCase().trim();
+  if (!normalizedMime) return false;
+  if (isTextLikeMimeType(normalizedMime)) return true;
+  if (WORD_MIME_TYPES.has(normalizedMime)) return true;
+  if (EXCEL_MIME_TYPES.has(normalizedMime)) return true;
+  return false;
+}
+
 function markJobFailed(job, error) {
   const detail = normalizeErrorMessage(error);
   const errorCode = String(error?.code || "ATTACHMENT_JOB_FAILED").trim() || "ATTACHMENT_JOB_FAILED";
@@ -2689,7 +2705,6 @@ function markJobFailed(job, error) {
 }
 
 async function executeAttachmentJob(job) {
-  const model = DEFAULT_MODEL;
   updateAttachmentJob(job, {
     status: "running",
     phase: "splitting",
@@ -2705,116 +2720,182 @@ async function executeAttachmentJob(job) {
   if (!primaryRecord) {
     throw createTaggedError("ATTACHMENT_RECORD_MISSING", "附件记录不存在或已过期", job.jobId, 404);
   }
-  const isPdf = String(primaryRecord.mimeType || "").toLowerCase() === "application/pdf";
-  let parts = [{
-    objectKey: primaryRecord.objectKey,
-    size: Number(primaryRecord.size) || 0,
-    fileName: primaryRecord.name,
-  }];
-  if (isPdf && Number(primaryRecord.size || 0) > GEMINI_PDF_MAX_BYTES) {
-    const split = await requestSplitWorkerForPdf({
-      record: primaryRecord,
-      traceId: job.traceId,
-    });
-    updateAttachmentJob(job, {
-      splitRequestId: String(split.splitRequestId || ""),
-      providerRequestId: String(split.splitRequestId || job.providerRequestId || ""),
-    });
-    parts = split.parts;
-  }
 
-  const summaries = [];
-  let partCounter = 0;
-  for (const part of parts) {
-    partCounter += 1;
-    updateAttachmentJob(job, {
-      phase: "uploading_to_gemini",
-      progress: Math.min(90, 10 + Math.floor((partCounter / parts.length) * 70)),
-      etaSec: estimateAttachmentJobEtaSeconds(job),
-    });
-    const signedUrl = buildSignedOssReadUrl(part.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
-    const downloaded = await downloadRemoteFileToTemp({
-      fileUrl: signedUrl,
-      expectedSize: part.size || primaryRecord.size,
-      fileName: part.fileName || primaryRecord.name,
-    });
-    let geminiFileName = "";
-    try {
-      const uploaded = await withTimeout(
-        ai.files.upload({
-          file: downloaded.path,
-          config: {
-            mimeType: primaryRecord.mimeType || "application/pdf",
-            displayName: normalizeFilename(part.fileName || primaryRecord.name, "attachment.pdf"),
-          },
-        }),
-        GEMINI_ATTACHMENT_SUMMARY_TIMEOUT_MS
-      );
-      const uploadRequestId = String(
-        readHeaderValue(uploaded?.response?.headers, "x-request-id")
-        || readHeaderValue(uploaded?.response?.headers, "x-acs-request-id")
-        || extractProviderRequestId(uploaded?.response?.requestId)
-      ).trim();
-      if (uploadRequestId) {
-        updateAttachmentJob(job, {
-          geminiUploadRequestId: uploadRequestId,
-          providerRequestId: uploadRequestId,
-        });
-      }
-      const fileUri = String(uploaded?.uri || "").trim();
-      geminiFileName = String(uploaded?.name || "").trim();
-      if (!fileUri || !geminiFileName) {
-        throw createTaggedError(
-          "GEMINI_FILE_UPLOAD_EMPTY",
-          "Gemini 文件上传失败",
-          `traceId=${job.traceId} part=${partCounter}`,
-          502
-        );
-      }
+  const primaryMimeType = String(primaryRecord.mimeType || "").toLowerCase().trim();
+  let safeSummary = "";
 
-      updateAttachmentJob(job, {
-        phase: "waiting_file_active",
-      });
-      await waitGeminiFileActive(geminiFileName, job.traceId);
-
-      updateAttachmentJob(job, {
-        phase: "summarizing",
-      });
-      const partSummary = await summarizeGeminiFilePart({
-        model,
-        fileUri,
-        mimeType: primaryRecord.mimeType || "application/pdf",
-        partIndex: partCounter,
-        totalParts: parts.length,
+  if (shouldUseGeminiFilePipeline(primaryMimeType)) {
+    const model = DEFAULT_MODEL;
+    const isPdf = primaryMimeType === "application/pdf";
+    let parts = [{
+      objectKey: primaryRecord.objectKey,
+      size: Number(primaryRecord.size) || 0,
+      fileName: primaryRecord.name,
+    }];
+    if (isPdf && Number(primaryRecord.size || 0) > GEMINI_PDF_MAX_BYTES) {
+      const split = await requestSplitWorkerForPdf({
+        record: primaryRecord,
         traceId: job.traceId,
       });
-      summaries.push(partSummary.summary);
-      if (partSummary.requestId) {
+      updateAttachmentJob(job, {
+        splitRequestId: String(split.splitRequestId || ""),
+        providerRequestId: String(split.splitRequestId || job.providerRequestId || ""),
+      });
+      parts = split.parts;
+    }
+
+    const summaries = [];
+    let partCounter = 0;
+    for (const part of parts) {
+      partCounter += 1;
+      updateAttachmentJob(job, {
+        phase: "uploading_to_gemini",
+        progress: Math.min(90, 10 + Math.floor((partCounter / parts.length) * 70)),
+        etaSec: estimateAttachmentJobEtaSeconds(job),
+      });
+      const signedUrl = buildSignedOssReadUrl(part.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
+      const downloaded = await downloadRemoteFileToTemp({
+        fileUrl: signedUrl,
+        expectedSize: part.size || primaryRecord.size,
+        fileName: part.fileName || primaryRecord.name,
+      });
+      let geminiFileName = "";
+      try {
+        const uploaded = await withTimeout(
+          ai.files.upload({
+            file: downloaded.path,
+            config: {
+              mimeType: primaryMimeType || "application/pdf",
+              displayName: normalizeFilename(part.fileName || primaryRecord.name, "attachment.pdf"),
+            },
+          }),
+          GEMINI_ATTACHMENT_SUMMARY_TIMEOUT_MS
+        );
+        const uploadRequestId = String(
+          readHeaderValue(uploaded?.response?.headers, "x-request-id")
+          || readHeaderValue(uploaded?.response?.headers, "x-acs-request-id")
+          || extractProviderRequestId(uploaded?.response?.requestId)
+        ).trim();
+        if (uploadRequestId) {
+          updateAttachmentJob(job, {
+            geminiUploadRequestId: uploadRequestId,
+            providerRequestId: uploadRequestId,
+          });
+        }
+        const fileUri = String(uploaded?.uri || "").trim();
+        geminiFileName = String(uploaded?.name || "").trim();
+        if (!fileUri || !geminiFileName) {
+          throw createTaggedError(
+            "GEMINI_FILE_UPLOAD_EMPTY",
+            "Gemini 文件上传失败",
+            `traceId=${job.traceId} part=${partCounter}`,
+            502
+          );
+        }
+
         updateAttachmentJob(job, {
-          geminiGenerateRequestId: partSummary.requestId,
-          providerRequestId: partSummary.requestId,
+          phase: "waiting_file_active",
         });
+        await waitGeminiFileActive(geminiFileName, job.traceId);
+
+        updateAttachmentJob(job, {
+          phase: "summarizing",
+        });
+        const partSummary = await summarizeGeminiFilePart({
+          model,
+          fileUri,
+          mimeType: primaryMimeType || "application/pdf",
+          partIndex: partCounter,
+          totalParts: parts.length,
+          traceId: job.traceId,
+        });
+        summaries.push(partSummary.summary);
+        if (partSummary.requestId) {
+          updateAttachmentJob(job, {
+            geminiGenerateRequestId: partSummary.requestId,
+            providerRequestId: partSummary.requestId,
+          });
+        }
+      } finally {
+        await safeUnlink(downloaded.path);
+        if (geminiFileName) {
+          await deleteGeminiFileByName(geminiFileName);
+        }
+      }
+    }
+
+    const mergedSummary = await mergeGeminiPartSummaries({
+      model,
+      summaries,
+      traceId: job.traceId,
+    });
+    if (mergedSummary.requestId) {
+      updateAttachmentJob(job, {
+        geminiGenerateRequestId: mergedSummary.requestId,
+        providerRequestId: mergedSummary.requestId,
+      });
+    }
+    safeSummary = String(mergedSummary.text || "").slice(0, FINANCIAL_DATA_MAX_CHARS);
+  } else if (shouldUseLocalTextExtraction(primaryMimeType)) {
+    updateAttachmentJob(job, {
+      phase: "summarizing",
+      progress: 40,
+      etaSec: estimateAttachmentJobEtaSeconds(job),
+    });
+    const signedUrl = buildSignedOssReadUrl(primaryRecord.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
+    const downloaded = await downloadRemoteFileToTemp({
+      fileUrl: signedUrl,
+      expectedSize: primaryRecord.size,
+      fileName: primaryRecord.name,
+    });
+    try {
+      let extractedText = "";
+      if (WORD_MIME_TYPES.has(primaryMimeType)) {
+        extractedText = await parseWordToText(downloaded.path, primaryMimeType);
+      } else if (EXCEL_MIME_TYPES.has(primaryMimeType)) {
+        extractedText = parseExcelToText(downloaded.path);
+      } else if (isTextLikeMimeType(primaryMimeType)) {
+        extractedText = await readUtf8TextLimited(downloaded.path, TEXT_EXTRACT_MAX_CHARS);
+      }
+      const rawText = String(extractedText || "").trim();
+      if (!rawText) {
+        throw createTaggedError(
+          "ATTACHMENT_TEXT_EXTRACT_EMPTY",
+          "附件文本提取结果为空，请确认文件内容后重试",
+          `mime=${primaryMimeType} name=${primaryRecord.name}`,
+          422
+        );
+      }
+      if (looksLikeFinancialPdf(primaryRecord.name, rawText)) {
+        const financialPayload = buildFinancialDataPayload({
+          rawText,
+          attachmentName: primaryRecord.name,
+        });
+        safeSummary = String(financialPayload.text || "").slice(0, FINANCIAL_DATA_MAX_CHARS);
+      } else {
+        safeSummary = rawText.slice(0, TEXT_EXTRACT_MAX_CHARS);
       }
     } finally {
       await safeUnlink(downloaded.path);
-      if (geminiFileName) {
-        await deleteGeminiFileByName(geminiFileName);
-      }
     }
+  } else {
+    throw createTaggedError(
+      "ATTACHMENT_MIME_NOT_SUPPORTED_FOR_SUMMARY",
+      "该附件类型暂不支持直接解析，请转 PDF/TXT 后重试",
+      `mime=${primaryMimeType} name=${primaryRecord.name}`,
+      415
+    );
   }
 
-  const mergedSummary = await mergeGeminiPartSummaries({
-    model,
-    summaries,
-    traceId: job.traceId,
-  });
-  if (mergedSummary.requestId) {
-    updateAttachmentJob(job, {
-      geminiGenerateRequestId: mergedSummary.requestId,
-      providerRequestId: mergedSummary.requestId,
-    });
+  if (!safeSummary) {
+    throw createTaggedError(
+      "ATTACHMENT_SUMMARY_EMPTY",
+      "附件解析结果为空，请重试或更换附件格式",
+      `mime=${primaryMimeType} name=${primaryRecord.name}`,
+      422
+    );
   }
-  const safeSummary = String(mergedSummary.text || "").slice(0, FINANCIAL_DATA_MAX_CHARS);
+
   updateAttachmentJob(job, {
     status: "succeeded",
     phase: "answered",
