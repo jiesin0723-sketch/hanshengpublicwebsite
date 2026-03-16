@@ -14,7 +14,7 @@ services:
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
-        value: gemini-2.5-pro
+        value: gemini-3.1-pro-preview
       - key: TRUST_PROXY
         value: "1"
       - key: RATE_LIMIT_WINDOW_MS
@@ -22,4 +22,90 @@ services:
       - key: RATE_LIMIT_MAX_REQUESTS
         value: "20"
       - key: MAX_ATTACHMENTS
-        value: "4"
+        value: "15"
+      - key: MAX_BINARY_ATTACHMENT_BYTES
+        value: "104857600"
+      - key: GEMINI_PDF_MAX_BYTES
+        value: "52428800"
+      - key: ATTACHMENT_JOB_MAX_QUEUE
+        value: "60"
+      - key: ATTACHMENT_JOB_MAX_RETRIES
+        value: "1"
+      - key: SPLIT_WORKER_URL
+        value: https://hansheng-split-worker.onrender.com/api/split
+      - key: SPLIT_WORKER_TOKEN
+        sync: false
+      - key: SPLIT_WORKER_TIMEOUT_MS
+        value: "240000"
+      - key: SPLIT_WORKER_PART_MAX_BYTES
+        value: "33554432"
+      - key: SPLIT_WORKER_MAX_RETRIES
+        value: "2"
+      - key: OSS_SIGNED_URL_EXPIRE_SECONDS
+        value: "3600"
+      - key: OSS_STS_ENABLED
+        value: "true"
+      - key: OSS_MULTIPART_PART_SIZE_BYTES
+        value: "4194304"
+      - key: OSS_MULTIPART_PARALLEL
+        value: "2"
+      - key: OSS_ENABLED
+        value: "true"
+      - key: OSS_BUCKET
+        sync: false
+      - key: OSS_ENDPOINT
+        sync: false
+      - key: OSS_REGION
+        sync: false
+      - key: OSS_ACCESS_KEY_ID
+        sync: false
+      - key: OSS_ACCESS_KEY_SECRET
+        sync: false
+
+  - type: web
+    name: hansheng-split-worker
+    runtime: node
+    rootDir: split-worker
+    plan: standard
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10001
+      - key: SPLIT_WORKER_TOKEN
+        sync: false
+      - key: SPLIT_MAX_CONCURRENCY
+        value: "1"
+      - key: SPLIT_QUEUE_LIMIT
+        value: "32"
+      - key: SPLIT_TIMEOUT_MS
+        value: "600000"
+      - key: SPLIT_MAX_RETRIES
+        value: "2"
+      - key: DOWNLOAD_TIMEOUT_MS
+        value: "240000"
+      - key: DOWNLOAD_MAX_BYTES
+        value: "220200960"
+      - key: DEFAULT_PART_MAX_BYTES
+        value: "33554432"
+      - key: MIN_PART_MAX_BYTES
+        value: "8388608"
+      - key: MAX_PART_MAX_BYTES
+        value: "41943040"
+      - key: MANIFEST_TTL_MS
+        value: "86400000"
+      - key: OSS_FORCE_HTTPS
+        value: "true"
+      - key: OSS_BUCKET
+        sync: false
+      - key: OSS_ENDPOINT
+        sync: false
+      - key: OSS_REGION
+        sync: false
+      - key: OSS_ACCESS_KEY_ID
+        sync: false
+      - key: OSS_ACCESS_KEY_SECRET
+        sync: false
