@@ -1117,10 +1117,25 @@ async function extractTextWithFallback(
   existingDocMindJobId = ""
 ) {
   let pdfParsedText = "";
+  let fileSizeBytes = 0;
   try {
-    pdfParsedText = await parsePdfToText(filePath);
+    const stat = await fsp.stat(filePath);
+    fileSizeBytes = Number(stat?.size || 0);
   } catch (error) {
-    console.warn("[审计] pdf-parse 提取失败，将尝试 OCR 兜底：", normalizeErrorMessage(error));
+    console.warn("[审计] 文件大小读取失败，继续尝试本地解析：", normalizeErrorMessage(error));
+  }
+
+  const shouldSkipLocalPdfParse = fileSizeBytes > LARGE_PDF_PARSE_THRESHOLD_BYTES;
+  if (shouldSkipLocalPdfParse) {
+    console.warn(
+      `[审计] PDF体积过大，跳过本地pdf-parse: size=${fileSizeBytes} threshold=${LARGE_PDF_PARSE_THRESHOLD_BYTES}`
+    );
+  } else {
+    try {
+      pdfParsedText = await parsePdfToText(filePath);
+    } catch (error) {
+      console.warn("[审计] pdf-parse 提取失败，将尝试 OCR 兜底：", normalizeErrorMessage(error));
+    }
   }
 
   if (pdfParsedText.length === 0) {
