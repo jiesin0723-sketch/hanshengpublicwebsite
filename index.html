@@ -1971,20 +1971,15 @@
                         setUploadFailed(item, errorMsg);
                         return;
                     }
-                    console.warn("[STS分片上传失败，尝试回退OSS直传]:", errorCode, errorMsg);
+                    console.warn("[STS分片上传失败，尝试回退后端上传]:", errorCode, errorMsg);
                     try {
-                        await uploadAttachmentViaOss(item, conversationId);
-                    } catch (ossFallbackError) {
-                        console.warn("[OSS直传失败，尝试回退后端上传]:", String(ossFallbackError?.message || ""));
-                        try {
-                            item.status = "uploading";
-                            item.progress = 0;
-                            renderAttachmentList();
-                            await uploadAttachmentViaBackend(item, conversationId);
-                        } catch (backendFallbackError) {
-                            console.error("[后端上传也失败]:", String(backendFallbackError?.message || ""));
-                            setUploadFailed(item, backendFallbackError?.message || String(ossFallbackError?.message || errorMsg || "upload failed"));
-                        }
+                        item.status = "uploading";
+                        item.progress = 0;
+                        renderAttachmentList();
+                        await uploadAttachmentViaBackend(item, conversationId);
+                    } catch (backendFallbackError) {
+                        console.error("[后端上传也失败]:", String(backendFallbackError?.message || ""));
+                        setUploadFailed(item, backendFallbackError?.message || errorMsg || "upload failed");
                     }
                 }
             })();

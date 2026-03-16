@@ -229,6 +229,7 @@ const CONTEXT_TTL_MS = readPositiveInt("CONTEXT_TTL_MS", 30 * 24 * 60 * 60 * 100
 const UPLOAD_ATTACHMENT_TTL_MS = readPositiveInt("UPLOAD_ATTACHMENT_TTL_MS", 24 * 60 * 60 * 1000);
 const TEXT_EXTRACT_MAX_CHARS = readPositiveInt("TEXT_EXTRACT_MAX_CHARS", 300_000);
 const LARGE_PDF_PARSE_THRESHOLD_BYTES = readPositiveInt("LARGE_PDF_PARSE_THRESHOLD_BYTES", 8 * 1024 * 1024);
+const URL_ONLY_DOC_PARSE_THRESHOLD_BYTES = readPositiveInt("URL_ONLY_DOC_PARSE_THRESHOLD_BYTES", 2 * 1024 * 1024);
 const OCR_PDF_MIN_TEXT_CHARS = readPositiveInt("OCR_PDF_MIN_TEXT_CHARS", 200);
 const ASYNC_ATTACHMENT_CONTEXT_CHARS = readPositiveInt("ASYNC_ATTACHMENT_CONTEXT_CHARS", 120_000);
 const DOCMIND_HTTP_TIMEOUT_MS = readPositiveInt("DOCMIND_HTTP_TIMEOUT_MS", 120_000);
@@ -1218,35 +1219,51 @@ async function extractTextWithFallback(
   fileUrl = "",
   progressReporter = null,
   sourceObjectKey = "",
-  existingDocMindJobId = ""
+  existingDocMindJobId = "",
+  options = {}
 ) {
+  const normalizedMimeType = normalizeUploadMimeType(options?.mimeType, options?.fileName || "");
+  const normalizedObjectKey = String(sourceObjectKey || "").trim().replace(/^\/+/, "");
+  const inferredNameFromOptions = normalizeFilename(options?.fileName || "", "document");
+  const isPdf = normalizedMimeType === "application/pdf"
+    || /\.pdf$/i.test(inferredNameFromOptions)
+    || /\.pdf$/i.test(normalizedObjectKey);
+  const preferRemoteOnly = Boolean(options?.preferRemoteOnly);
+  const normalizedFilePath = typeof filePath === "string" ? filePath.trim() : "";
+
   let pdfParsedText = "";
   let fileSizeBytes = 0;
-  try {
-    const stat = await fsp.stat(filePath);
-    fileSizeBytes = Number(stat?.size || 0);
-  } catch (error) {
-    console.warn("[审计] 文件大小读取失败，继续尝试本地解析：", normalizeErrorMessage(error));
-  }
-
-  const shouldSkipLocalPdfParse = fileSizeBytes > LARGE_PDF_PARSE_THRESHOLD_BYTES;
-  if (shouldSkipLocalPdfParse) {
-    console.warn(
-      `[审计] PDF体积过大，跳过本地pdf-parse: size=${fileSizeBytes} threshold=${LARGE_PDF_PARSE_THRESHOLD_BYTES}`
-    );
-  } else {
+  if (isPdf && normalizedFilePath && !preferRemoteOnly) {
     try {
-      pdfParsedText = await parsePdfToText(filePath);
+      const stat = await fsp.stat(normalizedFilePath);
+      fileSizeBytes = Number(stat?.size || 0);
     } catch (error) {
-      console.warn("[审计] pdf-parse 提取失败，将尝试 OCR 兜底：", normalizeErrorMessage(error));
+      console.warn("[审计] 文件大小读取失败，继续尝试本地解析：", normalizeErrorMessage(error));
     }
+
+    const shouldSkipLocalPdfParse = fileSizeBytes > LARGE_PDF_PARSE_THRESHOLD_BYTES;
+    if (shouldSkipLocalPdfParse) {
+      console.warn(
+        `[审计] PDF体积过大，跳过本地pdf-parse: size=${fileSizeBytes} threshold=${LARGE_PDF_PARSE_THRESHOLD_BYTES}`
+      );
+    } else {
+      try {
+        pdfParsedText = await parsePdfToText(normalizedFilePath);
+      } catch (error) {
+        console.warn("[审计] pdf-parse 提取失败，将尝试 OCR 兜底：", normalizeErrorMessage(error));
+      }
+    }
+  } else if (isPdf && preferRemoteOnly) {
+    console.log("[审计] 命中URL-only模式，跳过本地pdf-parse");
+  } else if (isPdf && !normalizedFilePath) {
+    console.log("[审计] 无本地文件路径，直接进入云端OCR/DocMind模式");
   }
 
-  if (pdfParsedText.length === 0) {
+  if (isPdf && pdfParsedText.length === 0) {
     console.warn("[审计] pdf-parse 提取字符数为 0，疑似扫描件 PDF");
   }
 
-  if (pdfParsedText.length >= OCR_PDF_MIN_TEXT_CHARS) {
+  if (isPdf && pdfParsedText.length >= OCR_PDF_MIN_TEXT_CHARS) {
     return {
       rawText: pdfParsedText,
       extractor: "pdf-parse",
@@ -1254,15 +1271,14 @@ async function extractTextWithFallback(
   }
 
   let signedFileUrl = String(fileUrl || "").trim();
-  const normalizedObjectKey = String(sourceObjectKey || "").trim().replace(/^\/+/, "");
   if (normalizedObjectKey) {
     try {
       signedFileUrl = buildSignedOssReadUrl(normalizedObjectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
-    } catch (signError) {
+    } catch (error) {
       throw createTaggedError(
         "SCANNED_PDF_OCR_FAILED",
         "读取云端案卷失败，请重试或截取关键页上传",
-        normalizeErrorMessage(signError),
+        normalizeErrorMessage(error),
         502
       );
     }
@@ -1284,7 +1300,10 @@ async function extractTextWithFallback(
 
   try {
     await probeSignedUrlForOcr(signedFileUrl);
-    const inferredName = normalizedObjectKey ? path.basename(normalizedObjectKey) : path.basename(filePath || "document.pdf");
+    const inferredName = normalizedObjectKey
+      ? path.basename(normalizedObjectKey)
+      : inferredNameFromOptions
+      || path.basename(normalizedFilePath || (isPdf ? "document.pdf" : "document.docx"));
     const normalizedJobId = String(existingDocMindJobId || "").trim();
     const jobId = normalizedJobId || (await submitDocMindStructureJob({ signedUrl: signedFileUrl, fileName: inferredName }));
     if (normalizedJobId) {
@@ -1731,6 +1750,12 @@ async function createUploadedAttachmentRecord({
   if (!mimeType) {
     throw new Error(`不支持的附件类型：${name}`);
   }
+  const filePath = typeof file?.path === "string" ? file.path : "";
+  const fileSize = Number(file?.size) || 0;
+  const normalizedSourceFileUrl = String(sourceFileUrl || "").trim();
+  const useUrlOnlyDocPipeline = Boolean(normalizedSourceFileUrl)
+    && fileSize > URL_ONLY_DOC_PARSE_THRESHOLD_BYTES
+    && (mimeType === "application/pdf" || WORD_MIME_TYPES.has(mimeType));
 
   const record = {
     id: nextUploadAttachmentId(),
@@ -1738,7 +1763,7 @@ async function createUploadedAttachmentRecord({
     conversationId,
     name,
     mimeType,
-    size: Number(file?.size) || 0,
+    size: fileSize,
     createdAt: Date.now(),
     expiresAt: Date.now() + UPLOAD_ATTACHMENT_TTL_MS,
     kind: "text",
@@ -1754,7 +1779,10 @@ async function createUploadedAttachmentRecord({
 
   try {
     if (isTextLikeMimeType(mimeType)) {
-      const text = await readUtf8TextLimited(file.path, TEXT_EXTRACT_MAX_CHARS);
+      if (!filePath) {
+        throw new Error(`附件缺少本地文件路径：${name}`);
+      }
+      const text = await readUtf8TextLimited(filePath, TEXT_EXTRACT_MAX_CHARS);
       record.kind = "text";
       record.text = text.slice(0, TEXT_EXTRACT_MAX_CHARS);
       record.textLimit = TEXT_EXTRACT_MAX_CHARS;
@@ -1762,7 +1790,27 @@ async function createUploadedAttachmentRecord({
     }
 
     if (WORD_MIME_TYPES.has(mimeType)) {
-      const text = await parseWordToText(file.path, mimeType);
+      if (useUrlOnlyDocPipeline) {
+        const extractedWord = await extractTextWithFallback(
+          "",
+          normalizedSourceFileUrl,
+          progressReporter,
+          sourceObjectKey,
+          sourceDocMindJobId,
+          { mimeType, fileName: name, preferRemoteOnly: true }
+        );
+        const text = String(extractedWord?.rawText || "");
+        record.kind = "text";
+        record.mimeType = "text/plain";
+        record.text = text.slice(0, TEXT_EXTRACT_MAX_CHARS);
+        record.textLimit = TEXT_EXTRACT_MAX_CHARS;
+        record.docMindJobId = String(extractedWord?.docMindJobId || "");
+        return record;
+      }
+      if (!filePath) {
+        throw new Error(`附件缺少本地文件路径：${name}`);
+      }
+      const text = await parseWordToText(filePath, mimeType);
       record.kind = "text";
       record.mimeType = "text/plain";
       record.text = String(text || "").slice(0, TEXT_EXTRACT_MAX_CHARS);
@@ -1771,7 +1819,10 @@ async function createUploadedAttachmentRecord({
     }
 
     if (EXCEL_MIME_TYPES.has(mimeType)) {
-      const text = parseExcelToText(file.path);
+      if (!filePath) {
+        throw new Error(`附件缺少本地文件路径：${name}`);
+      }
+      const text = parseExcelToText(filePath);
       record.kind = "text";
       record.mimeType = "text/plain";
       record.text = String(text || "").slice(0, TEXT_EXTRACT_MAX_CHARS);
@@ -1780,14 +1831,16 @@ async function createUploadedAttachmentRecord({
     }
 
     if (mimeType === "application/pdf") {
-      const shouldPreferTextPath = Number(file?.size || 0) >= LARGE_PDF_PARSE_THRESHOLD_BYTES;
+      const shouldPreferTextPath = fileSize >= LARGE_PDF_PARSE_THRESHOLD_BYTES;
+      const preferRemoteOnly = useUrlOnlyDocPipeline || (!filePath && Boolean(normalizedSourceFileUrl));
       try {
         const extractedPdf = await extractTextWithFallback(
-          file.path,
-          sourceFileUrl,
+          filePath,
+          normalizedSourceFileUrl,
           progressReporter,
           sourceObjectKey,
-          sourceDocMindJobId
+          sourceDocMindJobId,
+          { mimeType, fileName: name, preferRemoteOnly }
         );
         const pdfText = extractedPdf.rawText;
         if (pdfText) {
@@ -1803,6 +1856,7 @@ async function createUploadedAttachmentRecord({
               record.textLimit = FINANCIAL_DATA_MAX_CHARS;
               record.isFinancialData = true;
               record.usedChunkSummary = Boolean(financialPayload.usedChunkSummary);
+              record.docMindJobId = String(extractedPdf?.docMindJobId || "");
               return record;
             }
           }
@@ -1812,6 +1866,16 @@ async function createUploadedAttachmentRecord({
             record.mimeType = "text/plain";
             record.text = pdfText.slice(0, TEXT_EXTRACT_MAX_CHARS);
             record.textLimit = TEXT_EXTRACT_MAX_CHARS;
+            record.docMindJobId = String(extractedPdf?.docMindJobId || "");
+            return record;
+          }
+
+          if (preferRemoteOnly || !filePath) {
+            record.kind = "text";
+            record.mimeType = "text/plain";
+            record.text = pdfText.slice(0, TEXT_EXTRACT_MAX_CHARS);
+            record.textLimit = TEXT_EXTRACT_MAX_CHARS;
+            record.docMindJobId = String(extractedPdf?.docMindJobId || "");
             return record;
           }
         }
@@ -1827,9 +1891,12 @@ async function createUploadedAttachmentRecord({
     }
 
     if (PDF_IMAGE_MIME_TYPES.has(mimeType)) {
+      if (!filePath) {
+        throw new Error(`附件缺少本地文件路径：${name}`);
+      }
       try {
         const uploadedBinary = await uploadBinaryFileToGemini({
-          filePath: file.path,
+          filePath,
           mimeType,
           displayName: name,
         });
@@ -1842,11 +1909,12 @@ async function createUploadedAttachmentRecord({
         if (mimeType === "application/pdf") {
           try {
             const extractedPdf = await extractTextWithFallback(
-              file.path,
-              sourceFileUrl,
+              filePath,
+              normalizedSourceFileUrl,
               progressReporter,
               sourceObjectKey,
-              sourceDocMindJobId
+              sourceDocMindJobId,
+              { mimeType, fileName: name, preferRemoteOnly: !filePath && Boolean(normalizedSourceFileUrl) }
             );
             const pdfText = extractedPdf.rawText;
             if (pdfText) {
@@ -1854,6 +1922,7 @@ async function createUploadedAttachmentRecord({
               record.mimeType = "text/plain";
               record.text = pdfText.slice(0, TEXT_EXTRACT_MAX_CHARS);
               record.textLimit = TEXT_EXTRACT_MAX_CHARS;
+              record.docMindJobId = String(extractedPdf?.docMindJobId || "");
               return record;
             }
           } catch (fallbackPdfError) {
@@ -1866,7 +1935,7 @@ async function createUploadedAttachmentRecord({
         }
 
         // 二级兜底：改为inlineData，绕过Gemini文件上传接口。
-        const rawBuffer = await fsp.readFile(file.path);
+        const rawBuffer = await fsp.readFile(filePath);
         const base64 = rawBuffer.toString("base64");
         if (base64.length <= MAX_BASE64_ATTACHMENT_CHARS) {
           record.kind = "binary";
@@ -1881,7 +1950,7 @@ async function createUploadedAttachmentRecord({
 
     throw new Error(`不支持的附件类型：${name}（${mimeType}）`);
   } finally {
-    await safeUnlink(file.path);
+    await safeUnlink(filePath);
   }
 }
 
@@ -2105,25 +2174,53 @@ async function materializeUploadedAttachmentRecord(record, progressReporter = nu
     progressReporter("attachment", `正在读取附件：${record.name}`);
   }
   const signedUrl = buildSignedOssReadUrl(record.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
-  const downloaded = await downloadRemoteFileToTemp({
-    fileUrl: signedUrl,
-    expectedSize: record.size,
-    fileName: record.name,
-  });
-  const processed = await createUploadedAttachmentRecord({
-    file: {
-      originalname: record.name,
-      mimetype: record.mimeType,
-      size: downloaded.size,
-      path: downloaded.path,
-    },
-    userId: record.userId,
-    conversationId: record.conversationId,
-    sourceFileUrl: signedUrl,
-    sourceObjectKey: record.objectKey,
-    sourceDocMindJobId: record.docMindJobId || "",
-    progressReporter,
-  });
+  const isLargePdfOrWord = Number(record.size || 0) > URL_ONLY_DOC_PARSE_THRESHOLD_BYTES
+    && (
+      String(record.mimeType || "").toLowerCase() === "application/pdf"
+      || WORD_MIME_TYPES.has(String(record.mimeType || "").toLowerCase())
+    );
+  let processed;
+  if (isLargePdfOrWord) {
+    console.log(
+      "[审计] 命中URL-only大文件解析，跳过本地下载:",
+      `name=${record.name}`,
+      `mime=${record.mimeType}`,
+      `size=${Number(record.size || 0)}`
+    );
+    processed = await createUploadedAttachmentRecord({
+      file: {
+        originalname: record.name,
+        mimetype: record.mimeType,
+        size: Number(record.size) || 0,
+      },
+      userId: record.userId,
+      conversationId: record.conversationId,
+      sourceFileUrl: signedUrl,
+      sourceObjectKey: record.objectKey,
+      sourceDocMindJobId: record.docMindJobId || "",
+      progressReporter,
+    });
+  } else {
+    const downloaded = await downloadRemoteFileToTemp({
+      fileUrl: signedUrl,
+      expectedSize: record.size,
+      fileName: record.name,
+    });
+    processed = await createUploadedAttachmentRecord({
+      file: {
+        originalname: record.name,
+        mimetype: record.mimeType,
+        size: downloaded.size,
+        path: downloaded.path,
+      },
+      userId: record.userId,
+      conversationId: record.conversationId,
+      sourceFileUrl: signedUrl,
+      sourceObjectKey: record.objectKey,
+      sourceDocMindJobId: record.docMindJobId || "",
+      progressReporter,
+    });
+  }
   const materialized = {
     ...record,
     ...processed,
