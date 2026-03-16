@@ -2333,6 +2333,10 @@
                     historySnapshot,
                     timeoutMs
                 );
+                if (!thinkingFinished) {
+                    finishThinkingProgress(activeConversation.id);
+                    thinkingFinished = true;
+                }
                 addMessageToConversation(activeConversation.id, "ai", reply);
                 renderHistoryList();
                 if (getActiveConversation()?.id === activeConversation.id) {

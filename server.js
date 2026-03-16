@@ -280,6 +280,7 @@ const SPLIT_WORKER_URL = String(process.env.SPLIT_WORKER_URL || "").trim();
 const SPLIT_WORKER_TOKEN = String(process.env.SPLIT_WORKER_TOKEN || "").trim();
 const SPLIT_WORKER_TIMEOUT_MS = readPositiveInt("SPLIT_WORKER_TIMEOUT_MS", 180_000);
 const SPLIT_WORKER_PART_MAX_BYTES = readPositiveInt("SPLIT_WORKER_PART_MAX_BYTES", 35 * 1024 * 1024);
+const SPLIT_WORKER_MAX_RETRIES = readNonNegativeInt("SPLIT_WORKER_MAX_RETRIES", 2);
 
 const DEFAULT_ALLOWED_MODELS = [
   "gemini-3.1-pro-preview",
@@ -2430,74 +2431,108 @@ async function requestSplitWorkerForPdf({ record, traceId }) {
     );
   }
   const signedUrl = buildSignedOssReadUrl(record.objectKey, OSS_SIGNED_URL_EXPIRE_SECONDS);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), SPLIT_WORKER_TIMEOUT_MS);
-  try {
-    const headers = {
-      "Content-Type": "application/json",
-      "X-Trace-Id": traceId,
-    };
-    if (SPLIT_WORKER_TOKEN) {
-      headers.Authorization = `Bearer ${SPLIT_WORKER_TOKEN}`;
-    }
-    const response = await fetch(SPLIT_WORKER_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        objectKey: record.objectKey,
-        fileName: record.name,
-        mimeType: record.mimeType,
-        size: Number(record.size) || 0,
-        signedUrl,
-        maxPartBytes: SPLIT_WORKER_PART_MAX_BYTES,
-      }),
-      signal: controller.signal,
-    });
-    const rawText = await response.text();
-    let data = {};
+  const maxAttempts = Math.max(1, SPLIT_WORKER_MAX_RETRIES + 1);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SPLIT_WORKER_TIMEOUT_MS);
     try {
-      data = rawText ? JSON.parse(rawText) : {};
-    } catch {
-      data = {};
-    }
-    if (!response.ok) {
-      const detail = String(data?.message || rawText || `split-worker-http-${response.status}`).slice(0, 2000);
-      throw createTaggedError(
-        "SPLIT_WORKER_FAILED",
-        "案卷拆分失败，请稍后重试",
-        detail,
-        502
+      const headers = {
+        "Content-Type": "application/json",
+        "X-Trace-Id": traceId,
+      };
+      if (SPLIT_WORKER_TOKEN) {
+        headers.Authorization = `Bearer ${SPLIT_WORKER_TOKEN}`;
+      }
+      const response = await fetch(SPLIT_WORKER_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          objectKey: record.objectKey,
+          fileName: record.name,
+          mimeType: record.mimeType,
+          size: Number(record.size) || 0,
+          signedUrl,
+          maxPartBytes: SPLIT_WORKER_PART_MAX_BYTES,
+          etag: normalizeOssEtag(record.etag || ""),
+          conversationId: String(record.conversationId || ""),
+          userId: String(record.userId || ""),
+        }),
+        signal: controller.signal,
+      });
+      const rawText = await response.text();
+      let data = {};
+      try {
+        data = rawText ? JSON.parse(rawText) : {};
+      } catch {
+        data = {};
+      }
+      if (!response.ok) {
+        const detail = String(data?.message || rawText || `split-worker-http-${response.status}`).slice(0, 2000);
+        const tagged = createTaggedError(
+          "SPLIT_WORKER_FAILED",
+          "案卷拆分失败，请稍后重试",
+          detail,
+          response.status >= 500 ? 502 : response.status
+        );
+        tagged.responseStatus = Number(response.status) || 0;
+        throw tagged;
+      }
+      const splitRequestId = String(
+        data?.requestId
+        || response.headers.get("x-request-id")
+        || response.headers.get("x-acs-request-id")
+        || ""
+      ).trim();
+      const rawParts = Array.isArray(data?.parts) ? data.parts : [];
+      const normalizedParts = rawParts
+        .map((part, index) => ({
+          objectKey: String(part?.objectKey || "").trim().replace(/^\/+/, ""),
+          size: Number(part?.size) > 0 ? Number(part.size) : 0,
+          fileName: normalizeFilename(part?.fileName || `${record.name}_part_${index + 1}.pdf`, `${record.name}_part_${index + 1}.pdf`),
+        }))
+        .filter((part) => Boolean(part.objectKey));
+      if (normalizedParts.length === 0) {
+        throw createTaggedError(
+          "SPLIT_WORKER_EMPTY_PARTS",
+          "案卷拆分失败，请稍后重试",
+          "split worker returned empty parts",
+          502
+        );
+      }
+      console.log(
+        "[拆分服务返回]:",
+        `traceId=${traceId}`,
+        `attempt=${attempt}/${maxAttempts}`,
+        `requestId=${splitRequestId || "(empty)"}`,
+        `parts=${normalizedParts.length}`,
+        `objectKey=${record.objectKey}`
       );
-    }
-    const splitRequestId = String(
-      data?.requestId
-      || response.headers.get("x-request-id")
-      || response.headers.get("x-acs-request-id")
-      || ""
-    ).trim();
-    const rawParts = Array.isArray(data?.parts) ? data.parts : [];
-    const normalizedParts = rawParts
-      .map((part, index) => ({
-        objectKey: String(part?.objectKey || "").trim().replace(/^\/+/, ""),
-        size: Number(part?.size) > 0 ? Number(part.size) : 0,
-        fileName: normalizeFilename(part?.fileName || `${record.name}_part_${index + 1}.pdf`, `${record.name}_part_${index + 1}.pdf`),
-      }))
-      .filter((part) => Boolean(part.objectKey));
-    if (normalizedParts.length === 0) {
-      throw createTaggedError(
-        "SPLIT_WORKER_EMPTY_PARTS",
-        "案卷拆分失败，请稍后重试",
-        "split worker returned empty parts",
-        502
+      return {
+        splitRequestId,
+        parts: normalizedParts,
+      };
+    } catch (error) {
+      lastError = error;
+      const status = Number(error?.responseStatus || error?.statusCode || 0);
+      const retryableStatus = status === 429 || status === 502 || status === 503 || status === 504;
+      const retryable = attempt < maxAttempts && (isTransientError(error) || retryableStatus);
+      console.warn(
+        "[拆分服务调用失败]:",
+        `traceId=${traceId}`,
+        `attempt=${attempt}/${maxAttempts}`,
+        `retryable=${retryable}`,
+        `status=${status || 0}`,
+        `detail=${normalizeErrorMessage(error)}`
       );
+      if (!retryable) throw error;
+      await sleep(1200 * attempt);
+    } finally {
+      clearTimeout(timeout);
     }
-    return {
-      splitRequestId,
-      parts: normalizedParts,
-    };
-  } finally {
-    clearTimeout(timeout);
   }
+  throw lastError || createTaggedError("SPLIT_WORKER_FAILED", "案卷拆分失败，请稍后重试", "unknown split worker error", 502);
 }
 
 async function waitGeminiFileActive(fileName, traceId) {
@@ -4832,6 +4867,7 @@ app.listen(PORT, HOST, () => {
   console.log(`👉 任务队列：单实例并发=1，队列上限=${ATTACHMENT_JOB_MAX_QUEUE}`);
   console.log(`👉 Gemini PDF阈值：${Math.floor(GEMINI_PDF_MAX_BYTES / 1024 / 1024)}MB（超限触发外部拆分）`);
   console.log(`👉 外部拆分Worker：${SPLIT_WORKER_URL ? "已配置" : "未配置"}`);
+  console.log(`👉 拆分调用重试：${SPLIT_WORKER_MAX_RETRIES} 次`);
   console.log(`👉 上传保留时长：${Math.round(UPLOAD_ATTACHMENT_TTL_MS / 1000 / 60)} 分钟`);
   console.log(`👉 运行环境：${NODE_ENV}`);
   console.log(`👉 接口限流：${RATE_LIMIT_MAX_REQUESTS}次/${Math.round(RATE_LIMIT_WINDOW_MS / 1000)}秒`);
