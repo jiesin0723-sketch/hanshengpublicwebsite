@@ -503,6 +503,7 @@ const conversationContexts = new Map();
 const uploadedAttachments = new Map();
 const attachmentMaterializationTasks = new Map();
 const processingFiles = new Map();
+const docMindJobRegistry = new Map();
 const conversationProgress = new Map();
 const UPLOAD_TMP_DIR = path.join(__dirname, ".upload-tmp");
 fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
@@ -1113,6 +1114,88 @@ async function submitDocMindStructureJob({ signedUrl, fileName }) {
   return jobId;
 }
 
+function getDocMindRegistryEntry(objectKey) {
+  const normalizedObjectKey = String(objectKey || "").trim().replace(/^\/+/, "");
+  if (!normalizedObjectKey) return { key: "", entry: null };
+  return {
+    key: normalizedObjectKey,
+    entry: docMindJobRegistry.get(normalizedObjectKey) || null,
+  };
+}
+
+function upsertDocMindRegistry(objectKey, patch) {
+  const normalizedObjectKey = String(objectKey || "").trim().replace(/^\/+/, "");
+  if (!normalizedObjectKey) return null;
+  const prev = docMindJobRegistry.get(normalizedObjectKey) || {};
+  const next = {
+    ...prev,
+    ...patch,
+    updatedAt: Date.now(),
+  };
+  docMindJobRegistry.set(normalizedObjectKey, next);
+  return next;
+}
+
+async function getOrCreateDocMindJobId({
+  objectKey,
+  existingJobId = "",
+  signedUrl,
+  fileName,
+}) {
+  const normalizedObjectKey = String(objectKey || "").trim().replace(/^\/+/, "");
+  const normalizedExistingJobId = String(existingJobId || "").trim();
+  if (!normalizedObjectKey) {
+    return normalizedExistingJobId || submitDocMindStructureJob({ signedUrl, fileName });
+  }
+
+  if (normalizedExistingJobId) {
+    upsertDocMindRegistry(normalizedObjectKey, {
+      jobId: normalizedExistingJobId,
+      state: "processing",
+    });
+    return normalizedExistingJobId;
+  }
+
+  const current = docMindJobRegistry.get(normalizedObjectKey);
+  const cachedJobId = String(current?.jobId || "").trim();
+  if (cachedJobId) {
+    upsertDocMindRegistry(normalizedObjectKey, {
+      state: String(current?.state || "processing") === "ready" ? "ready" : "processing",
+    });
+    return cachedJobId;
+  }
+
+  if (current?.submitPromise && typeof current.submitPromise.then === "function") {
+    return current.submitPromise;
+  }
+
+  const submitPromise = (async () => {
+    const jobId = await submitDocMindStructureJob({ signedUrl, fileName });
+    upsertDocMindRegistry(normalizedObjectKey, {
+      jobId,
+      state: "processing",
+      submitCount: Number(current?.submitCount || 0) + 1,
+      submitPromise: null,
+    });
+    return jobId;
+  })()
+    .catch((error) => {
+      upsertDocMindRegistry(normalizedObjectKey, {
+        state: "failed",
+        lastError: normalizeErrorMessage(error),
+        submitPromise: null,
+      });
+      throw error;
+    });
+
+  upsertDocMindRegistry(normalizedObjectKey, {
+    state: "submitting",
+    submitPromise,
+  });
+
+  return submitPromise;
+}
+
 async function pollDocMindStructureResult(jobId, progressReporter = null) {
   const client = getAliyunDocMindClient();
   const maxAttempts = Math.max(1, DOCMIND_POLL_MAX_ATTEMPTS);
@@ -1304,25 +1387,57 @@ async function extractTextWithFallback(
       ? path.basename(normalizedObjectKey)
       : inferredNameFromOptions
       || path.basename(normalizedFilePath || (isPdf ? "document.pdf" : "document.docx"));
-    const normalizedJobId = String(existingDocMindJobId || "").trim();
-    const jobId = normalizedJobId || (await submitDocMindStructureJob({ signedUrl: signedFileUrl, fileName: inferredName }));
-    if (normalizedJobId) {
-      console.log(`[审计] DocMind任务续轮询: jobId=${jobId}`);
+    const cachedBefore = normalizedObjectKey ? getDocMindRegistryEntry(normalizedObjectKey).entry : null;
+    const normalizedJobId = await getOrCreateDocMindJobId({
+      objectKey: normalizedObjectKey,
+      existingJobId: existingDocMindJobId,
+      signedUrl: signedFileUrl,
+      fileName: inferredName,
+    });
+    const fromRegistry = Boolean(
+      cachedBefore
+      && !String(existingDocMindJobId || "").trim()
+      && String(cachedBefore.jobId || "").trim() === normalizedJobId
+    );
+    if (String(existingDocMindJobId || "").trim()) {
+      console.log(`[审计] DocMind任务续轮询: jobId=${normalizedJobId}`);
+    } else if (fromRegistry) {
+      console.log(`[审计] DocMind任务复用: jobId=${normalizedJobId}`);
     } else {
-      console.log(`[审计] DocMind任务提交成功: jobId=${jobId}`);
+      console.log(`[审计] DocMind任务提交成功: jobId=${normalizedJobId}`);
     }
-    const ocrText = await pollDocMindStructureResult(jobId, progressReporter);
+    const ocrText = await pollDocMindStructureResult(normalizedJobId, progressReporter);
+    if (normalizedObjectKey) {
+      upsertDocMindRegistry(normalizedObjectKey, {
+        jobId: normalizedJobId,
+        state: "ready",
+        lastError: "",
+      });
+    }
     return {
       rawText: ocrText,
       extractor: "aliyun-docmind-async",
-      docMindJobId: "",
+      docMindJobId: normalizedJobId,
     };
   } catch (error) {
     if (String(error?.code || "") === "DOCMIND_POLL_TIMEOUT") {
+      if (normalizedObjectKey) {
+        upsertDocMindRegistry(normalizedObjectKey, {
+          jobId: String(error?.jobId || existingDocMindJobId || "").trim(),
+          state: "processing",
+          lastError: "",
+        });
+      }
       throw error;
     }
     logDocMindRawError("[DocMind完整错误]", error);
     const detail = normalizeErrorMessage(error);
+    if (normalizedObjectKey) {
+      upsertDocMindRegistry(normalizedObjectKey, {
+        state: "failed",
+        lastError: detail,
+      });
+    }
     if (/unexpected token\s*['"]?</i.test(detail) || detail.includes("<?xml")) {
       console.error("[阿里云真实拦截原因]:", detail);
     }
@@ -2265,6 +2380,7 @@ function scheduleAttachmentMaterialization(record) {
   const current = uploadedAttachments.get(record.id) || record;
   if (attachmentMaterializationTasks.has(current.id)) return;
   if (current.kind !== "remote") return;
+  if (["ready", "failed"].includes(String(current.parseStatus || "").toLowerCase())) return;
   if (current.parseStatus === "processing") return;
   const objectKey = String(current.objectKey || "").trim();
   if (objectKey && processingFiles.has(objectKey)) {
@@ -2830,7 +2946,7 @@ async function handleUploadStatus(req, res) {
     uploadedAttachments.set(record.id, record);
     if (record.kind === "remote") {
       const parseStatus = String(record.parseStatus || "").toLowerCase();
-      if (parseStatus === "pending" || parseStatus === "processing") {
+      if (parseStatus === "pending") {
         scheduleAttachmentMaterialization(record);
       }
     }
@@ -2878,6 +2994,19 @@ setInterval(() => {
         removeUploadedAttachmentRecord(record, { deleteRemote: true })
       )
     ).catch(() => {});
+  }
+
+  const activeObjectKeys = new Set();
+  for (const record of uploadedAttachments.values()) {
+    const objectKey = String(record?.objectKey || "").trim().replace(/^\/+/, "");
+    if (objectKey) activeObjectKeys.add(objectKey);
+  }
+  for (const [objectKey, state] of docMindJobRegistry.entries()) {
+    const updatedAt = Number(state?.updatedAt || 0);
+    const expired = updatedAt > 0 && updatedAt + UPLOAD_ATTACHMENT_TTL_MS <= now;
+    if (!activeObjectKeys.has(objectKey) || expired) {
+      docMindJobRegistry.delete(objectKey);
+    }
   }
 }, 30_000).unref();
 
